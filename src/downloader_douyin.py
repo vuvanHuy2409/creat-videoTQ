@@ -57,7 +57,7 @@ def _bitrate_of(url: str) -> int:
 
 def _extract_via_playwright(
     url: str,
-    wait_seconds: float = 20.0,
+    wait_seconds: float = 45.0,
     headless: bool | None = None,
 ) -> dict:
     """Open the Douyin page and capture direct CDN URLs for video + audio.
@@ -73,33 +73,66 @@ def _extract_via_playwright(
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
     ]
+    
+    import os
+    user_data_dir = os.path.join(os.path.dirname(__file__), "..", "playwright_profile")
+    
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=launch_args)
-        context = browser.new_context(
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless,
             user_agent=_UA,
             viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
+            args=launch_args
         )
         # Hide webdriver flag — Douyin checks navigator.webdriver
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
 
         captured = {"dash_video": [], "dash_audio": [], "progressive": []}
 
-        def on_request(req):
-            u = req.url
-            if not _CDN_HOST_RE.search(u):
+        def check_url_and_add(u: str):
+            if not u:
                 return
-            if _DASH_VIDEO_RE.search(u):
+            if _DASH_VIDEO_RE.search(u) or ("video" in u and ("v26" in u or "v3" in u or "v9" in u or "v11" in u or "amemv" in u)):
                 captured["dash_video"].append(u)
-            elif _DASH_AUDIO_RE.search(u):
+            elif _DASH_AUDIO_RE.search(u) or ("audio" in u and ("v26" in u or "v3" in u or "v9" in u or "v11" in u or "amemv" in u)):
                 captured["dash_audio"].append(u)
-            elif _VIDEO_MIME_RE.search(u):
+            elif _VIDEO_MIME_RE.search(u) or (".mp4" in u and _CDN_HOST_RE.search(u)):
                 captured["progressive"].append(u)
 
+        def on_request(req):
+            u = req.url
+            if _CDN_HOST_RE.search(u) or ".mp4" in u or "v26-" in u or "v3-" in u:
+                check_url_and_add(u)
+
+        def on_response(res):
+            u = res.url
+            if "aweme/detail" in u or "iteminfo" in u:
+                try:
+                    data = res.json()
+                    # Try extracting video URLs directly from API responses if present
+                    aweme = data.get("aweme_detail") or data.get("item_list", [{}])[0]
+                    video = aweme.get("video", {})
+                    play_addr = video.get("play_addr", {}).get("url_list", [])
+                    for p_url in play_addr:
+                        captured["progressive"].append(p_url)
+                except Exception:
+                    pass
+
         page.on("request", on_request)
+        page.on("response", on_response)
+
+        # Normalize URL to a direct video link if a video ID is present
+        # This prevents issues with search pages or modal popups not auto-playing
+        m = _VIDEO_ID_RE.search(url)
+        if m:
+            vid = m.group(1) or m.group(2)
+            if vid:
+                url = f"https://www.douyin.com/video/{vid}"
 
         logger.info(f"Loading Douyin page: {url}")
         try:
@@ -107,17 +140,27 @@ def _extract_via_playwright(
         except Exception as e:
             logger.warning(f"page.goto encountered warning/timeout: {e}. Checking captured requests...")
 
+        # Attempt to trigger video playback by clicking or scrolling if video didn't start automatically
+        try:
+            page.evaluate("window.scrollTo(0, 200);")
+        except Exception:
+            pass
+
         deadline = time.time() + wait_seconds
+        warned = False
         while time.time() < deadline:
             if captured["progressive"] or (captured["dash_video"] and captured["dash_audio"]):
                 break
+            if not warned and (time.time() > deadline - wait_seconds + 5):
+                logger.warning("Trình duyệt đang chờ tải video. Nếu thấy yêu cầu xác minh (Captcha), vui lòng giải quyết trực tiếp trên cửa sổ trình duyệt Chromium đang mở.")
+                warned = True
             page.wait_for_timeout(500)
 
         title = page.title() or ""
         title = re.sub(r"\s*[-–]\s*抖音\s*$", "", title).strip()
         canonical = page.url
 
-        browser.close()
+        context.close()
 
     logger.info(
         f"Captured: progressive={len(captured['progressive'])} "
@@ -208,6 +251,28 @@ def download_douyin(
     """
     if not url:
         raise ValueError("URL cannot be empty")
+    url = url.strip()
+    m = re.search(r"https?://[^\s]+", url)
+    if m:
+        url = m.group(0)
+
+    # 1. Resolve mobile shortlinks to avoid jumping to the next video in the feed
+    if "v.douyin.com" in url:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"}
+            r = requests.get(url, headers=headers, allow_redirects=False, timeout=10)
+            if r.status_code in (301, 302) and "Location" in r.headers:
+                loc = r.headers["Location"]
+                m2 = re.search(r"/(?:video|note|item)/(\d+)", loc)
+                if m2:
+                    url = f"https://www.douyin.com/video/{m2.group(1)}"
+                else:
+                    r2 = requests.get(loc, headers=headers, allow_redirects=True, timeout=10)
+                    m3 = re.search(r"/(?:video|note|item)/(\d+)", r2.url)
+                    if m3:
+                        url = f"https://www.douyin.com/video/{m3.group(1)}"
+        except Exception as e:
+            logger.warning(f"Failed to resolve Douyin shortlink {url}: {e}")
 
     ensure_dir(output_dir)
 

@@ -178,8 +178,6 @@ class Btn(tk.Label):
             return f"#{r:02x}{g:02x}{b:02x}"
         except Exception:
             return h
-
-
 # ─── KHUNG CUỘN THẨM MỸ ──────────────────────────────────────────────
 class ScrollFrame:
     def __init__(self, parent, bg=BG):
@@ -227,7 +225,111 @@ class App(tk.Tk):
         self._pages = {}
         self._cur   = None
         self._build_layout()
+        self._build_menu()
         self._show("projects")
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+        
+        sys_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Hệ thống", menu=sys_menu)
+        sys_menu.add_command(label="Kiểm tra toàn trạng hệ thống...", command=self._test_system_status)
+        
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Công cụ AI", menu=tools_menu)
+        tools_menu.add_command(label="Kiểm tra kết nối Gemini API...", command=self._test_gemini_api)
+        
+    def _test_gemini_api(self):
+        from config import GOOGLE_API_KEY, CONTENT_MODEL_ID
+        if not GOOGLE_API_KEY:
+            messagebox.showerror("Lỗi", "Không tìm thấy GOOGLE_API_KEY. Vui lòng vào 'Cài đặt Hệ thống' để thêm API Key của bạn.")
+            return
+        if not GOOGLE_API_KEY.startswith("AIza"):
+            messagebox.showwarning("Cảnh báo định dạng", "Mã của bạn không bắt đầu bằng 'AIza' (tiêu chuẩn của Google API Key).\n\nCó vẻ như bạn đang dùng Token xác thực (OAuth/Session Token) thay vì API Key. Hệ thống vẫn sẽ thử kết nối, nhưng khả năng cao sẽ gặp lỗi 401 UNAUTHENTICATED.")
+            
+        def _run_test():
+            try:
+                from config import CONTENT_MODEL_ID
+                
+                # Cập nhật theo chuẩn mới: Truyền thẳng qua HTTP REST để tránh lỗi của SDK google-genai
+                if GOOGLE_API_KEY.startswith("AQ."):
+                    import urllib.request
+                    import json
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{CONTENT_MODEL_ID}:generateContent"
+                    data = {"contents": [{"parts": [{"text": "Hãy nói 'API hoạt động rất tốt!' bằng tiếng Việt."}]}]}
+                    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'))
+                    req.add_header("Content-Type", "application/json")
+                    req.add_header("x-goog-api-key", GOOGLE_API_KEY)
+                    
+                    with urllib.request.urlopen(req, timeout=15) as res:
+                        resp_data = json.loads(res.read().decode('utf-8'))
+                        ai_text = resp_data["candidates"][0]["content"]["parts"][0]["text"]
+                        self.after(0, lambda: messagebox.showinfo("Kiểm tra thành công", f"Kết nối Gemini API (Chuẩn mới) thành công!\n\nAI trả lời: {ai_text}"))
+                else:
+                    from google import genai
+                    client = genai.Client(api_key=GOOGLE_API_KEY)
+                    response = client.models.generate_content(
+                        model=CONTENT_MODEL_ID,
+                        contents="Hãy nói 'API hoạt động rất tốt!' bằng tiếng Việt.",
+                    )
+                    self.after(0, lambda: messagebox.showinfo("Kiểm tra thành công", f"Kết nối Gemini API thành công!\n\nAI trả lời: {response.text}"))
+                    
+            except Exception as e:
+                err_msg = str(e)
+                if hasattr(e, 'read'):
+                    err_msg += "\n" + e.read().decode('utf-8')
+                self.after(0, lambda err=err_msg: messagebox.showerror("Lỗi kết nối", f"Không thể kết nối tới Gemini API.\nChi tiết lỗi:\n{err}"))
+                
+        # Hiển thị thông báo đang test
+        messagebox.showinfo("Đang kiểm tra", "Đang gửi yêu cầu test đến hệ thống của Google... Vui lòng đợi trong giây lát.")
+        threading.Thread(target=_run_test, daemon=True).start()
+
+    def _test_system_status(self):
+        def _run_checks():
+            results = []
+            
+            # 1. Kiểm tra FFmpeg
+            try:
+                subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+                results.append("✅ FFmpeg: Đã cài đặt và sẵn sàng")
+            except Exception:
+                results.append("❌ FFmpeg: CHƯA CÀI ĐẶT hoặc lỗi đường dẫn (Cần thiết để xử lý video)")
+
+            # 2. Kiểm tra Thư viện AI (Torch)
+            try:
+                import torch
+                gpu = "Có GPU (MPS/CUDA)" if (torch.backends.mps.is_available() or torch.cuda.is_available()) else "Chỉ dùng CPU"
+                results.append(f"✅ PyTorch AI: Sẵn sàng ({gpu})")
+            except ImportError:
+                results.append("❌ PyTorch AI: Lỗi (Chưa cài đặt thư viện 'torch')")
+
+            # 3. Kiểm tra EasyOCR
+            try:
+                import easyocr
+                results.append("✅ EasyOCR: Sẵn sàng (Dùng để xoá chữ AI)")
+            except ImportError:
+                results.append("❌ EasyOCR: Lỗi (Chưa cài đặt)")
+
+            # 4. Kiểm tra API Keys cơ bản
+            from config import GOOGLE_API_KEY, VIETNAMESE_API_KEY
+            if GOOGLE_API_KEY:
+                results.append("✅ Gemini API Key: Đã cấu hình")
+            else:
+                results.append("⚠️ Gemini API Key: Chưa cấu hình (Tính năng tự động dịch sẽ không hoạt động)")
+                
+            if VIETNAMESE_API_KEY:
+                results.append("✅ LucyLab TTS API Key: Đã cấu hình")
+            else:
+                results.append("⚠️ LucyLab TTS API Key: Chưa cấu hình (Giọng đọc tiếng Việt có thể không hoạt động)")
+
+            # Hiển thị kết quả
+            msg = "\n\n".join(results)
+            self.after(0, lambda: messagebox.showinfo("Kết quả kiểm tra hệ thống", f"Tình trạng các thành phần hệ thống:\n\n{msg}"))
+
+        messagebox.showinfo("Đang kiểm tra", "Hệ thống đang quét các thành phần và thư viện AI... Quá trình này mất khoảng vài giây.")
+        threading.Thread(target=_run_checks, daemon=True).start()
+
 
     def _build_layout(self):
         # Sidebar thanh bên cực đẹp
@@ -685,7 +787,7 @@ class NewProjectPage(tk.Frame):
         self._full_json= ""
         self._q        = queue.Queue()
         self._polling  = False
-        self.blur_region = None   # (x, y, w, h) trong pixel video gốc
+        self.sub_size_var = tk.StringVar(value="40 (Khuyên dùng)")
         self._build()
 
     def _build(self):
@@ -761,7 +863,7 @@ class NewProjectPage(tk.Frame):
         self.voice_var       = tk.StringVar(value="male")
         self.bg_var          = tk.StringVar(value="demucs")
         self.sub_y_var       = tk.StringVar(value="780")
-        self.sub_size_var    = tk.StringVar(value="40 (Vừa)")
+        self.sub_size_var    = tk.StringVar(value="40 (Khuyên dùng)")
         
         # Ngôn ngữ nguồn
         tk.Label(og, text="Ngôn ngữ gốc của video", font=FS, bg=WHITE, fg=MUTED).grid(row=0, column=0, padx=(0, 24), sticky="w")
@@ -782,18 +884,9 @@ class NewProjectPage(tk.Frame):
         tk.Label(og, text="Xử lý Nhạc nền (BGM)", font=FS, bg=WHITE, fg=MUTED).grid(row=0, column=3, padx=(0, 24), sticky="w")
         ttk.Combobox(og, textvariable=self.bg_var, values=["demucs", "duck", "none"], state="readonly", width=14).grid(row=1, column=3, padx=(0, 24), sticky="w", pady=(6, 0))
         
-        # Checkbox vẽ cứng phụ đề
-        self.burn_subtitles_var = tk.BooleanVar(value=False)
-        cb_burn = tk.Checkbutton(c3, text="Vẽ cứng phụ đề lên video (Burn Subtitles)",
-                                 variable=self.burn_subtitles_var, font=FB, bg=WHITE, fg=TEXT, activebackground=WHITE)
-        cb_burn.pack(anchor="w", pady=(12, 0))
-        
-        # Checkbox OCR Replace (nhận diện + đè phụ đề gốc)
+        # Biến trạng thái ẩn (không hiển thị UI)
+        self.burn_subtitles_var = tk.BooleanVar(value=True)
         self.ocr_replace_var = tk.BooleanVar(value=False)
-        cb_ocr = tk.Checkbutton(c3,
-                                text="🔍 Vẽ đè hộp trắng che phụ đề cũ (Mask Subtitles)",
-                                variable=self.ocr_replace_var, font=FB, bg=WHITE, fg="#1d4ed8", activebackground=WHITE)
-        cb_ocr.pack(anchor="w", pady=(6, 0))
         
         # Nút Bắt đầu
         bf = tk.Frame(panel, bg=BG)
@@ -824,6 +917,27 @@ class NewProjectPage(tk.Frame):
         self._asr_st = tk.Label(panel, text="", font=FB, bg=BG, fg=MUTED, pady=6)
         self._asr_st.pack()
         
+        # Thêm cấu hình vị trí phụ đề vào Bước 2
+        sub_card, _ = self._card(panel, "Cấu hình vị trí & cỡ chữ phụ đề (Có thể thiết lập trong lúc đợi)")
+        
+        cb_burn = tk.Checkbutton(sub_card, text="Vẽ cứng phụ đề lên video (Burn Subtitles)",
+                                 variable=self.burn_subtitles_var, font=FB, bg=WHITE, fg=TEXT, activebackground=WHITE)
+        cb_burn.pack(anchor="w", pady=(10, 0))
+        
+        # Vị trí Y đã được tự động hoá hoàn toàn dựa vào toạ độ gốc nên không cần hiển thị nữa.
+        
+        size_frame = tk.Frame(sub_card, bg=WHITE)
+        size_frame.pack(anchor="w", pady=(10, 0))
+        tk.Label(size_frame, text="Cỡ chữ phụ đề (Khuyên dùng):", font=FB, bg=WHITE, fg=TEXT).pack(side="left")
+        self.sub_size_combo = ttk.Combobox(
+            size_frame,
+            textvariable=self.sub_size_var,
+            values=["35 (Nhỏ)", "40 (Khuyên dùng)", "45 (Vừa)", "50 (To)", "55", "60", "65", "70 (Lớn nhất)"],
+            state="readonly",
+            width=16
+        )
+        self.sub_size_combo.pack(side="left", padx=6)
+        
         # Nút quay lại thiết lập khi có lỗi
         self.asr_back_btn = Btn(panel, "Quay lại Thiết lập", command=lambda: self._goto(0), bg="#475569")
         self.asr_back_btn.pack(pady=10)
@@ -846,358 +960,31 @@ class NewProjectPage(tk.Frame):
         self._copy_ok.pack(side="left", padx=12)
         
         # Paste b
-        c2, _ = self._card(panel, "Dán bản dịch JSON của bạn vào đây")
+        c2, _ = self._card(panel, "Dịch thuật (Tuỳ chọn: AI hoặc Thủ công)")
+        
+        gemini_frame = tk.Frame(c2, bg=WHITE)
+        gemini_frame.pack(fill="x", pady=(0, 10))
+        
+        tk.Label(gemini_frame, text="Lựa chọn 1: Dịch tự động bằng AI", font=FB, bg=WHITE, fg="#4338CA").pack(anchor="w")
+        tk.Label(gemini_frame, text="Sử dụng Gemini AI để dịch tự động, kết quả sẽ tự động điền vào ô bên dưới để bạn có thể xem lại trước khi chạy.", font=FS, bg=WHITE, fg=MUTED).pack(anchor="w", pady=(0, 4))
+        self._btn_gemini = Btn(gemini_frame, "🤖 Tự động dịch bằng Gemini AI", command=self._translate_with_gemini, bg="#8B5CF6", fg=WHITE, padx=14, pady=6)
+        self._btn_gemini.pack(anchor="w")
+        
+        tk.Label(c2, text="Lựa chọn 2: Dịch thủ công (Hoặc chỉnh sửa bản dịch AI)", font=FB, bg=WHITE, fg="#4338CA").pack(anchor="w", pady=(10, 4))
+        
         self._trans_in = scrolledtext.ScrolledText(c2, font=FM, bg="#F8FAFC", fg=TEXT, height=12, relief="flat", wrap="word")
         self._trans_in.pack(fill="x")
         
-        # ═ Card: Che phụ đề gốc bằng khung mờ nhám ═
-        blur_card, _ = self._card(panel, "🌫️  Che phụ đề tiếng Trung bằng khung mờ nhám (Frosted Glass)")
+        # Tự động bật Xoá phụ đề gốc bằng AI, không cần hỏi ở giao diện nữa
+        self.ai_blur_var = tk.BooleanVar(value=True)
         
-        # Mô tả tính năng
-        tk.Label(blur_card,
-                 text="Khựng mờ nhám trong suốt sẽ được chợng lên vị trí chứa phụ đề gốc, "
-                      "nằm trên video để che kín chữ nước ngoài và nằm dưới bản dịch mới.",
-                 font=FS, bg=WHITE, fg=MUTED, wraplength=700, justify="left").pack(anchor="w", pady=(0, 10))
-        
-        # Hàng checkbox bật/tắt
-        self.blur_enable_var = tk.BooleanVar(value=False)
-        blur_row = tk.Frame(blur_card, bg=WHITE)
-        blur_row.pack(fill="x")
-        
-        cb_blur = tk.Checkbutton(
-            blur_row,
-            text="✅  Bật khung mờ nhám che phụ đề gốc",
-            variable=self.blur_enable_var,
-            font=FB, bg=WHITE, fg="#4338CA", activebackground=WHITE,
-            command=self._on_blur_toggle
-        )
-        cb_blur.pack(side="left")
-        
-        # Nút kéo chọn vùng
-        self._blur_select_btn = Btn(
-            blur_row,
-            "📸  Kéo chọn vùng trên video",
-            command=self._open_blur_region_dialog,
-            bg="#6D28D9", padx=10, pady=4
-        )
-        self._blur_select_btn.pack(side="left", padx=(16, 0))
-        
-        # Nhãn hiển thị vùng đã chọn
-        self._blur_region_lbl = tk.Label(
-            blur_card,
-            text="△  Chưa chọn vùng — nhấn nút trên để kéo chọn",
-            font=FS, bg=WHITE, fg=MUTED, pady=6, anchor="w"
-        )
-        self._blur_region_lbl.pack(fill="x", pady=(8, 0))
-        
-        # Preview mini của vùng đã chọn (canvas hiển thị hình chữ nhật)
-        self._blur_preview_frame = tk.Frame(blur_card, bg="#F1F5F9",
-                                            highlightbackground=BORDER, highlightthickness=1,
-                                            height=60)
-        self._blur_preview_frame.pack(fill="x", pady=(6, 0))
-        self._blur_preview_frame.pack_propagate(False)
-        self._blur_preview_canvas = tk.Canvas(self._blur_preview_frame,
-                                              bg="#F1F5F9", highlightthickness=0, height=60)
-        self._blur_preview_canvas.pack(fill="both", expand=True)
-        self._blur_preview_canvas.create_text(400, 30, text="Chưa có vùng nào được chọn",
-                                              fill=MUTED, font=FS, tags="hint")
-        
-        # Tắt select button theo mặc định
-        self._blur_select_btn.config(state="disabled", bg="#94A3B8")
-        
-        # Chọn giọng lồng tiếng trước khi chạy TTS
-        v_card, _ = self._card(panel, "Chọn cấu hình lồng tiếng & phụ đề")
-        vf = tk.Frame(v_card, bg=WHITE)
-        vf.pack(fill="x")
-        tk.Label(vf, text="Giọng đọc lồng tiếng:", font=FB, bg=WHITE, fg=MUTED).pack(side="left")
-        self.cb_voice_step3 = ttk.Combobox(vf, textvariable=self.voice_var, state="readonly", width=22)
-        self.cb_voice_step3.pack(side="left", padx=(12, 0))
-        
-        cb_burn_step3 = tk.Checkbutton(v_card, text="Vẽ cứng phụ đề lên video (Burn Subtitles)",
-                                       variable=self.burn_subtitles_var, font=FB, bg=WHITE, fg=TEXT, activebackground=WHITE)
-        cb_burn_step3.pack(anchor="w", pady=(10, 0))
-        
-        cb_ocr_step3 = tk.Checkbutton(v_card,
-                                      text="🔍 Vẽ đè hộp trắng che phụ đề cũ (Mask Subtitles)",
-                                      variable=self.ocr_replace_var, font=FB, bg=WHITE, fg="#1d4ed8", activebackground=WHITE)
-        cb_ocr_step3.pack(anchor="w", pady=(6, 0))
-        
-        # Nhập Y pixel và nút đo vị trí
-        y_frame = tk.Frame(v_card, bg=WHITE)
-        y_frame.pack(anchor="w", pady=(10, 0))
-        tk.Label(y_frame, text="Vị trí Y phụ đề (pixel từ đỉnh video):", font=FB, bg=WHITE, fg=TEXT).pack(side="left")
-        self.sub_y_entry = tk.Entry(y_frame, textvariable=self.sub_y_var, font=FB, width=6, justify="center")
-        self.sub_y_entry.pack(side="left", padx=6)
-        Btn(y_frame, "🔍 Đo vị trí Y từ video", command=self._open_measure_dialog, padx=8, pady=2).pack(side="left", padx=10)
-        
-        # Nhập cỡ chữ phụ đề với gợi ý
-        size_frame = tk.Frame(v_card, bg=WHITE)
-        size_frame.pack(anchor="w", pady=(10, 0))
-        tk.Label(size_frame, text="Cỡ chữ phụ đề (Khuyên dùng):", font=FB, bg=WHITE, fg=TEXT).pack(side="left")
-        self.sub_size_combo = ttk.Combobox(
-            size_frame,
-            textvariable=self.sub_size_var,
-            values=["32 (Nhỏ)", "40 (Vừa)", "50 (To)", "60 (Rất to)", "70 (Khổng lồ)"],
-            state="readonly",
-            width=16
-        )
-        self.sub_size_combo.pack(side="left", padx=6)
-        
+
         bf = tk.Frame(panel, bg=BG)
         bf.pack(fill="x", padx=40, pady=(16, 24))
         Btn(bf, "Khởi chạy Tổng hợp giọng nói (TTS) & Render Video", command=self._start_tts).pack(side="left")
         return panel
 
-    def _on_blur_toggle(self):
-        """Bật/tắt nút chọn vùng khi checkbox thay đổi."""
-        if self.blur_enable_var.get():
-            self._blur_select_btn.config(state="normal", bg="#6D28D9")
-        else:
-            self._blur_select_btn.config(state="disabled", bg="#94A3B8")
-            self.blur_region = None
-            self._blur_region_lbl.config(
-                text="△  Chưa chọn vùng — nhấn nút trên để kéo chọn",
-                fg=MUTED
-            )
-            self._blur_preview_canvas.delete("all")
-            self._blur_preview_canvas.create_text(400, 30,
-                text="Chưa có vùng nào được chọn", fill=MUTED, font=FS, tags="hint")
 
-    def _open_blur_region_dialog(self):
-        """Mở hộp thoại chọn vùng che bằng cách kéo thả, tự động lấy ảnh ngẫu nhiên."""
-        video_path = None
-        if self._work_dir and self._work_dir.exists():
-            for f in self._work_dir.iterdir():
-                if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov", ".avi") \
-                        and not f.name.startswith("dubbed"):
-                    video_path = f
-                    break
-        if not video_path and self.file_var.get().strip():
-            candidate = Path(self.file_var.get().strip())
-            if candidate.exists():
-                video_path = candidate
-        if not video_path:
-            messagebox.showerror("Lỗi", "Không tìm thấy tệp video nguồn. Hãy chọn file ở Bước 1 trước.")
-            return
-
-        import cv2
-        import random
-        from PIL import Image as PILImage, ImageTk as PILImageTk, ImageFilter
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            messagebox.showerror("Lỗi", f"Không mở được video: {video_path}")
-            return
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        max_w, max_h = 1000, 560
-        scale = min(max_w / orig_w, max_h / orig_h, 1.0)
-        disp_w = int(orig_w * scale)
-        disp_h = int(orig_h * scale)
-
-        dialog = tk.Toplevel(self)
-        dialog.title("🌫️ Kéo chọn vùng che phụ đề gốc (Ảnh ngẫu nhiên)")
-        dialog.configure(bg=WHITE)
-        dialog.transient(self)
-        dialog.grab_set()
-
-        def on_close():
-            cap.release()
-            dialog.destroy()
-        dialog.protocol("WM_DELETE_WINDOW", on_close)
-
-        hdr = tk.Frame(dialog, bg=PRIMARY, padx=20, pady=8)
-        hdr.pack(fill="x")
-        tk.Label(hdr,
-                 text="⇑ Nhấn giữ + Kéo chuột trên video để chọn vùng che chữ gốc. Bấm '🔄 Đổi ảnh ngẫu nhiên khác' nếu ảnh hiện tại không có chữ.",
-                 font=FB, bg=PRIMARY, fg=WHITE).pack(anchor="w")
-
-        canvas = tk.Canvas(dialog, width=disp_w, height=disp_h,
-                           highlightthickness=0, cursor="crosshair", bg="#0F172A")
-        canvas.pack()
-
-        # Chọn frame ngẫu nhiên ban đầu từ 5% đến 95% thời lượng video để tránh frame đen ở đầu/cuối
-        start_f = int(total_frames * 0.05)
-        end_f = int(total_frames * 0.95)
-        if start_f >= end_f:
-            start_f = 0
-            end_f = max(0, total_frames - 1)
-        init_frame = random.randint(start_f, end_f) if end_f > start_f else start_f
-
-        state = {
-            "frame_idx": init_frame,
-            "rect_id": None,
-            "region": self.blur_region,
-            "tk_img": None,
-            "disp_img": None
-        }
-        drag = {"x0": None, "y0": None}
-        status_var = tk.StringVar(value="— Kéo chuột trên hình để chọn vùng cần che —")
-        tk.Label(dialog, textvariable=status_var, font=FB, bg=WHITE, fg="#4338CA", pady=8).pack(fill="x", padx=20)
-
-        def _to_orig(dx, dy): return int(dx / scale), int(dy / scale)
-        def _clamp(v, lo, hi): return max(lo, min(hi, v))
-
-        def update_canvas_image(x0, y0, x1, y1):
-            if state["disp_img"] is None:
-                return
-            temp_img = state["disp_img"].copy()
-            if x0 is not None and y0 is not None and x1 is not None and y1 is not None:
-                bx0, by0 = min(x0, x1), min(y0, y1)
-                bx1, by1 = max(x0, x1), max(y0, y1)
-                if (bx1 - bx0) > 4 and (by1 - by0) > 4:
-                    crop_box = (bx0, by0, bx1, by1)
-                    cropped = temp_img.crop(crop_box)
-                    blurred = cropped.filter(ImageFilter.GaussianBlur(15))
-                    blended = PILImage.blend(cropped, blurred, 0.65)
-                    temp_img.paste(blended, crop_box)
-            
-            state["tk_img"] = PILImageTk.PhotoImage(temp_img)
-            canvas.delete("bg_img")
-            canvas.create_image(0, 0, anchor="nw", image=state["tk_img"], tags="bg_img")
-            canvas.image = state["tk_img"]
-            canvas.tag_lower("bg_img")
-
-        def load_and_render_frame():
-            cap.set(cv2.CAP_PROP_POS_FRAMES, state["frame_idx"])
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
-            if not ret: return
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            disp_img = PILImage.fromarray(frame_rgb).resize((disp_w, disp_h), PILImage.Resampling.LANCZOS)
-            state["disp_img"] = disp_img
-            
-            if state["region"]:
-                rx, ry, rw, rh = state["region"]
-                dx0, dy0 = int(rx * scale), int(ry * scale)
-                dx1, dy1 = int((rx + rw) * scale), int((ry + rh) * scale)
-                update_canvas_image(dx0, dy0, dx1, dy1)
-            else:
-                update_canvas_image(None, None, None, None)
-            draw_selection()
-
-        def draw_selection():
-            if state["rect_id"]: canvas.delete(state["rect_id"])
-            if state["region"]:
-                rx, ry, rw, rh = state["region"]
-                dx0 = rx * scale
-                dy0 = ry * scale
-                dx1 = (rx + rw) * scale
-                dy1 = (ry + rh) * scale
-                state["rect_id"] = canvas.create_rectangle(dx0, dy0, dx1, dy1, outline="#7C3AED", width=2)
-                update_canvas_image(int(dx0), int(dy0), int(dx1), int(dy1))
-            else:
-                update_canvas_image(None, None, None, None)
-
-        def on_press(e):
-            drag.update({"x0": e.x, "y0": e.y})
-            if state["rect_id"]:
-                canvas.delete(state["rect_id"])
-                state["rect_id"] = None
-            state["region"] = None
-            update_canvas_image(None, None, None, None)
-
-        def on_drag(e):
-            x0, y0 = drag["x0"], drag["y0"]
-            if x0 is None: return
-            x1, y1 = _clamp(e.x, 0, disp_w), _clamp(e.y, 0, disp_h)
-            
-            update_canvas_image(x0, y0, x1, y1)
-            if state["rect_id"]: canvas.delete(state["rect_id"])
-            state["rect_id"] = canvas.create_rectangle(x0, y0, x1, y1, outline="#6D28D9", width=2, dash=(6, 3))
-            
-            ox0, oy0 = _to_orig(min(x0, x1), min(y0, y1))
-            ox1, oy1 = _to_orig(max(x0, x1), max(y0, y1))
-            status_var.set(f"➤  Vùng đang vẽ: x={ox0}, y={oy0}, rộng={ox1-ox0}px, cao={oy1-oy0}px")
-
-        def on_release(e):
-            x0, y0 = drag["x0"], drag["y0"]
-            if x0 is None: return
-            x1, y1 = _clamp(e.x, 0, disp_w), _clamp(e.y, 0, disp_h)
-            ox0, oy0 = _to_orig(min(x0, x1), min(y0, y1))
-            ox1, oy1 = _to_orig(max(x0, x1), max(y0, y1))
-            state["region"] = (ox0, oy0, ox1 - ox0, oy1 - oy0)
-            draw_selection()
-            status_var.set(f"✓ Đã chọn: x={ox0}, y={oy0}, rộng={ox1-ox0}px, cao={oy1-oy0}px  —  Nhấn Xác nhận bên dưới")
-
-        canvas.bind("<ButtonPress-1>",   on_press)
-        canvas.bind("<B1-Motion>",        on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
-
-        ft = tk.Frame(dialog, bg=WHITE, pady=12)
-        ft.pack(fill="x", padx=20)
-
-        def save_and_close():
-            region = state["region"]
-            if not region or region[2] < 4 or region[3] < 4:
-                messagebox.showwarning("Chưa chọn", "Vui lòng kéo chọn vùng trên hình trước.")
-                return
-            self.blur_region = region
-            x, y, w, h = region
-            self._blur_region_lbl.config(
-                text=f"✅  Vùng đã chọn: x={x}, y={y}, rộng={w}px, cao={h}px",
-                fg=SUCCESS
-            )
-            dialog.destroy()
-            cap.release()
-
-        def clear_and_close():
-            self.blur_region = None
-            self._blur_region_lbl.config(
-                text="△  Chưa chọn vùng — nhấn nút trên để kéo chọn", fg=MUTED)
-            self._blur_preview_canvas.delete("all")
-            self._blur_preview_canvas.create_text(400, 30,
-                text="Chưa có vùng nào được chọn", fill=MUTED, font=FS)
-            dialog.destroy()
-            cap.release()
-
-        def randomize_frame():
-            state["frame_idx"] = random.randint(start_f, end_f) if end_f > start_f else start_f
-            load_and_render_frame()
-
-        Btn(ft, "✓  Xác nhận vùng đã chọn", command=save_and_close,
-            bg=SUCCESS, padx=16, pady=8).pack(side="left")
-        Btn(ft, "🔄  Đổi ảnh ngẫu nhiên khác", command=randomize_frame,
-            bg="#2563EB", fg=WHITE, padx=12, pady=8).pack(side="left", padx=(10, 0))
-        Btn(ft, "×  Xóa và đóng", command=clear_and_close,
-            bg=DANGER, fg=WHITE, padx=12, pady=8).pack(side="left", padx=(10, 0))
-        Btn(ft, "Hủy", command=dialog.destroy,
-            bg=BORDER, fg=TEXT, padx=12, pady=8).pack(side="right")
-
-        load_and_render_frame()
-
-        # Căn giữa dialog
-        dialog.update_idletasks()
-        sw = dialog.winfo_screenwidth()
-        sh = dialog.winfo_screenheight()
-        dw = dialog.winfo_width()
-        dh = dialog.winfo_height()
-        dialog.geometry(f"+{(sw - dw) // 2}+{(sh - dh) // 2}")
-
-    def _update_blur_preview(self, disp_img, x0, region, orig_w, orig_h):
-        """Cập nhật canvas preview mini với hình chữ nhật đã chọn."""
-        try:
-            from PIL import Image as PILImage, ImageTk as PILImageTk, ImageFilter
-            x, y, w, h = region
-            # Tạo thumb nhỏ với rectangle highlight
-            thumb = disp_img.copy().resize((600, 50), PILImage.Resampling.LANCZOS)
-            ph = PILImageTk.PhotoImage(thumb)
-            self._blur_preview_canvas.delete("all")
-            # Vẽ background video
-            c = self._blur_preview_canvas
-            c.config(width=600, height=60)
-            # Hiển thị thông tin dạng text thông thường
-            c.create_text(
-                10, 30,
-                text=f"🌫️  Vùng mờ nhám:  x={x}, y={y}, rộng={w}px, cao={h}px  —  Video gốc: {orig_w}×{orig_h}px",
-                fill="#4338CA", font=(FF, 10, "bold"), anchor="w"
-            )
-        except Exception:
-            pass
 
     def _mk_p4(self, body):
         panel = tk.Frame(body, bg=BG)
@@ -1222,6 +1009,7 @@ class NewProjectPage(tk.Frame):
         
         br = tk.Frame(c, bg=WHITE, pady=16)
         br.pack()
+        Btn(br, "Xem video", command=self._play_video, bg="#3b82f6", padx=14).pack(side="left", padx=6)
         Btn(br, "Tải tệp Video xuống", command=self._download_video, padx=14).pack(side="left", padx=6)
         Btn(br, "Dự án mới", command=self.app.reset_new, bg="#475569", padx=14).pack(side="left", padx=6)
         Btn(br, "Về danh sách", command=lambda: self.app._show("projects"), bg=BORDER, fg=TEXT, padx=14).pack(side="left", padx=6)
@@ -1271,6 +1059,9 @@ class NewProjectPage(tk.Frame):
             cmd += ["--burn-subtitles"]
         if self.ocr_replace_var.get():
             cmd += ["--ocr-replace"]
+            
+        # Luôn bật tính năng AI xoá phụ đề gốc
+        cmd += ["--ai-blur"]
                 
         self._goto(1)
         self._wlog(self._asr_log, f"$ {' '.join(cmd)}\n\n")
@@ -1283,18 +1074,32 @@ class NewProjectPage(tk.Frame):
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(BASE_DIR), env=env)
                 found = None
                 
+                # Tìm đường dẫn tuyệt đối từ dòng log "Output folder: ..."
+                # Bắt cả dạng "Output folder:" và "Resuming work directory:"
+                re_abs = re.compile(r"(?:Output folder|Resuming work directory):\s*(.+)")
+                # Fallback: tìm theo pattern tương đối như trước
                 re_pattern = r"output[/\\]VN[/\\]([\w]+_vi)" if "Việt" in target else r"output[/\\]([\d]+)\b"
                 target_output_dir = OUTPUT_DIR if "Việt" in target else (BASE_DIR / "output")
                 
                 for line in proc.stdout:
                     self._q.put(("log_asr", line))
-                    m = re.search(re_pattern, line)
-                    if m and found is None:
-                        cand = target_output_dir / m.group(1)
-                        if cand.is_dir():
-                            found = cand
+                    # Ưu tiên parse đường dẫn tuyệt đối
+                    if found is None:
+                        m_abs = re_abs.search(line)
+                        if m_abs:
+                            cand = Path(m_abs.group(1).strip())
+                            if cand.is_dir():
+                                found = cand
+                    # Fallback regex tương đối
+                    if found is None:
+                        m = re.search(re_pattern, line)
+                        if m:
+                            cand = target_output_dir / m.group(1)
+                            if cand.is_dir():
+                                found = cand
                 proc.wait()
                 
+                # Exit code != 0 chỉ báo lỗi thực sự (không phải translate_pending)
                 if proc.returncode != 0:
                     self._q.put(("error", f"Quy trình ASR thất bại với mã lỗi (Exit code={proc.returncode}). Vui lòng xem log chi tiết."))
                     return
@@ -1310,6 +1115,7 @@ class NewProjectPage(tk.Frame):
                 self._q.put(("error", str(ex)))
 
         threading.Thread(target=_run, daemon=True).start()
+
 
     def _start_tts(self):
         raw = self._trans_in.get("1.0", "end").strip()
@@ -1355,10 +1161,9 @@ class NewProjectPage(tk.Frame):
         # Trích xuất số cỡ chữ từ chuỗi (ví dụ "38 (Rất to)" -> "38")
         sub_size_str = self.sub_size_var.get().split()[0]
         cmd += ["--subtitle-size", sub_size_str]
-        # Truyền vùng blur nếu đã chọn và được bật
-        if self.blur_enable_var.get() and self.blur_region:
-            x, y, w, h = self.blur_region
-            cmd += ["--blur-region", f"{x}:{y}:{w}:{h}"]
+        # Truyền cờ AI blur nếu được bật
+        if self.ai_blur_var.get():
+            cmd += ["--ai-blur"]
             
         self._goto(3)
         self._wlog(self._tts_log, f"$ {' '.join(cmd)}\n\n")
@@ -1619,18 +1424,8 @@ class NewProjectPage(tk.Frame):
         else:
             self.after(100, self._poll)
 
-    def load_project(self, proj):
-        """Tải dữ liệu từ dự án chưa hoàn thành để tiếp tục từ bước dịch thuật."""
-        self._work_dir = proj["path"]
-        # Đặt ngôn ngữ đích đúng
-        if proj["lang"] == "VI":
-            self.target_lang_var.set("Tiếng Việt (VI)")
-        else:
-            self.target_lang_var.set("Tiếng Nhật (JP)")
-        # Tải lại JSON và chuyển sang bước dịch thuật
-        self._prep_translate()
-
     def _prep_translate(self):
+        """Đọc file JSON gốc, điền vào ô hiển thị, rồi chuyển sang Bước 3 (Dịch thuật)."""
         orig = self._work_dir / "transcript_original.json" if self._work_dir else None
         if orig and orig.exists():
             try:
@@ -1647,7 +1442,7 @@ class NewProjectPage(tk.Frame):
             self._full_json = ""
             self._json_prev.config(text="Không tìm thấy file kết quả transcript_original.json")
 
-        # Tự động tải bản dịch đã dịch sẵn (nếu có) vào ô nhập liệu
+        # Tự động tải bản dịch đã có (nếu có) vào ô nhập liệu
         self._trans_in.delete("1.0", "end")
         target = self.target_lang_var.get()
         is_vi = "Việt" in target
@@ -1658,20 +1453,33 @@ class NewProjectPage(tk.Frame):
                 trans_items = json.loads(trans_path.read_text(encoding="utf-8"))
                 trans_json_str = json.dumps(trans_items, ensure_ascii=False, indent=2)
                 self._trans_in.insert("1.0", trans_json_str)
-            except Exception as e:
-                pass  # Không báo lỗi nếu chưa có bản dịch
-        # Cập nhật danh sách giọng cho combobox ở Step 3
-        target = self.target_lang_var.get()
+            except Exception:
+                pass
+        # Đảm bảo giọng đọc khớp ngôn ngữ đích
         if "Việt" in target:
-            self.cb_voice_step3.config(values=["male", "female"])
             if self.voice_var.get() not in ["male", "female"]:
                 self.voice_var.set("male")
         else:
-            self.cb_voice_step3.config(values=["ja-JP-KeitaNeural", "ja-JP-NanamiNeural", "ja-JP-NaokiNeural", "ja-JP-MayuNeural"])
             if not self.voice_var.get().startswith("ja-JP"):
                 self.voice_var.set("ja-JP-KeitaNeural")
-                
+
+        # Tự động dịch và tiếp tục sang bước TTS lồng tiếng tự động
         self._goto(2)
+        if not (trans_path and trans_path.exists()):
+            self._translate_with_gemini(auto_start_tts=True)
+        else:
+            self._start_tts()
+
+    def load_project(self, proj):
+        """Tải dữ liệu từ dự án chưa hoàn thành để tiếp tục từ bước dịch thuật."""
+        self._work_dir = proj["path"]
+        # Đặt ngôn ngữ đích đúng
+        if proj["lang"] == "VI":
+            self.target_lang_var.set("Tiếng Việt (VI)")
+        else:
+            self.target_lang_var.set("Tiếng Nhật (JP)")
+        # Gọi hàm chuẩn để điền dữ liệu và chuyển trang
+        self._prep_translate()
 
     def _copy_json(self):
         if not self._full_json:
@@ -1682,6 +1490,45 @@ class NewProjectPage(tk.Frame):
         self._copy_ok.config(text="Đã sao chép vào Clipboard!")
         self.after(2000, lambda: self._copy_ok.config(text=""))
 
+    def _translate_with_gemini(self, auto_start_tts=False):
+        if not self._full_json:
+            messagebox.showwarning("Trống dữ liệu", "Không tìm thấy nội dung JSON nguồn.")
+            return
+            
+        target = self.target_lang_var.get()
+        target_lang = "Vietnamese" if "Việt" in target else "Japanese"
+        
+        self._btn_gemini.config(text="Đang dịch... (Vui lòng đợi)", state="disabled", bg="#9CA3AF")
+        
+        def _run_translation():
+            try:
+                from src.translator import translate_json_openai
+                translated_json = translate_json_openai(self._full_json, target_lang)
+                
+                # Update UI in main thread
+                def _update_ui():
+                    self._trans_in.delete("1.0", "end")
+                    self._trans_in.insert("1.0", translated_json)
+                    self._btn_gemini.config(text="🤖 Tự động dịch bằng OpenAI AI", state="normal", bg="#8B5CF6")
+                    if auto_start_tts:
+                        self._start_tts()
+                    else:
+                        messagebox.showinfo("Thành công", "Đã dịch xong bằng OpenAI AI!")
+                    
+                self.after(0, _update_ui)
+                
+            except Exception as e:
+                err_msg = str(e)
+                def _show_err():
+                    self._btn_gemini.config(text="🤖 Tự động dịch bằng OpenAI AI", state="normal", bg="#8B5CF6")
+                    if auto_start_tts:
+                        messagebox.showerror("Lỗi dịch AI", f"Không thể tự động dịch bằng OpenAI. Vui lòng thử lại hoặc dịch thủ công:\n\n{err_msg}")
+                    else:
+                        messagebox.showerror("Lỗi dịch AI", f"Không thể dịch bằng OpenAI:\n\n{err_msg}")
+                self.after(0, _show_err)
+
+        threading.Thread(target=_run_translation, daemon=True).start()
+
     def _go_done(self):
         self._done_lbl.config(text=str(self._dubbed) if self._dubbed else "")
         if self._work_dir and self._dubbed:
@@ -1689,6 +1536,21 @@ class NewProjectPage(tk.Frame):
             if not thumb.exists():
                 extract_thumbnail(self._dubbed, thumb)
         self._goto(4)
+        
+        # Phát âm thanh thông báo "ting" (chỉ chạy trên macOS)
+        try:
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"])
+        except Exception:
+            pass
+
+    def _play_video(self):
+        if not self._dubbed or not self._dubbed.exists():
+            messagebox.showerror("Lỗi", "Không tìm thấy video đích đã xử lý.")
+            return
+        try:
+            subprocess.Popen(["open", str(self._dubbed)])
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể mở video:\n{e}")
 
     def _download_video(self):
         if not self._dubbed or not self._dubbed.exists():
@@ -1729,11 +1591,16 @@ class SettingsPage(tk.Frame):
             ("LUCYLAB_API_URL",           "Đường dẫn LucyLab API URL", False),
             ("VIETNAMESE_TTS_MAX_SPEED",  "Tốc độ tối đa của TTS Việt", False),
         ]),
+        ("OpenAI API (Dùng dịch thuật tự động)", [
+            ("OPENAI_API_KEY", "OpenAI API Key", True),
+            ("OPENAI_MODEL_ID", "Model OpenAI (vd: gpt-4o-mini)", False),
+        ]),
         ("Google Gemini API (Tuỳ chọn — Tạo mô tả & ảnh thu nhỏ)", [
             ("GOOGLE_API_KEY", "Gemini API Key", True),
             ("IMAGE_MODEL_ID", "Model tạo ảnh (Image Model)", False),
             ("CONTENT_MODEL_ID", "Model văn bản (Content Model)", False),
         ]),
+
         ("Cấu hình xử lý tệp & thông số chung", [
             ("DEFAULT_SOURCE_LANG", "Mã ngôn ngữ nguồn mặc định", False),
             ("AUDIO_SAMPLE_RATE",   "Tần số lấy mẫu âm thanh (Hz)", False),
@@ -1802,6 +1669,51 @@ class SettingsPage(tk.Frame):
         Btn(bot, "Lưu cấu hình (.env)", command=self._save, padx=20, pady=10).pack(side="left")
         self._saved_lbl = tk.Label(bot, text="", font=FB, bg=BG, fg=SUCCESS)
         self._saved_lbl.pack(side="left", padx=14)
+
+    def _test_gemini(self):
+        api_key = self._vars.get("GOOGLE_API_KEY").get().strip()
+        if not api_key:
+            messagebox.showerror("Lỗi", "Vui lòng nhập Gemini API Key vào ô trống trước khi thử kết nối.")
+            return
+        if not api_key.startswith("AIza"):
+            messagebox.showwarning("Cảnh báo định dạng", "Mã của bạn không bắt đầu bằng 'AIza'.\n\nĐây có thể là mã OAuth Token thay vì API Key. Hệ thống vẫn sẽ thử gửi lên Google, nhưng nếu gặp lỗi 401 thì bạn cần vào lại AI Studio để lấy đúng API Key nhé.")
+            
+        def _run_test():
+            try:
+                from config import CONTENT_MODEL_ID
+                
+                # Cập nhật theo chuẩn mới: Truyền thẳng qua HTTP REST để tránh lỗi của SDK google-genai
+                if api_key.startswith("AQ."):
+                    import urllib.request
+                    import json
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{CONTENT_MODEL_ID}:generateContent"
+                    data = {"contents": [{"parts": [{"text": "Hãy trả lời duy nhất một câu: 'Hoạt động tốt!' bằng tiếng Việt."}]}]}
+                    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'))
+                    req.add_header("Content-Type", "application/json")
+                    req.add_header("x-goog-api-key", api_key)
+                    
+                    with urllib.request.urlopen(req, timeout=15) as res:
+                        resp_data = json.loads(res.read().decode('utf-8'))
+                        ai_text = resp_data["candidates"][0]["content"]["parts"][0]["text"]
+                        self.after(0, lambda: messagebox.showinfo("Thành công", f"Gemini API (Chuẩn mới) phản hồi thành công!\n\nKết quả từ AI: {ai_text}"))
+                else:
+                    from google import genai
+                    client = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model=CONTENT_MODEL_ID,
+                        contents="Hãy trả lời duy nhất một câu: 'Hoạt động tốt!' bằng tiếng Việt.",
+                    )
+                    self.after(0, lambda: messagebox.showinfo("Thành công", f"Gemini API phản hồi thành công!\n\nKết quả từ AI: {response.text}"))
+                    
+            except Exception as e:
+                err_msg = str(e)
+                if hasattr(e, 'read'):
+                    err_msg += "\n" + e.read().decode('utf-8')
+                self.after(0, lambda err=err_msg: messagebox.showerror("Lỗi kết nối", f"Không thể kết nối đến Gemini.\n\nChi tiết lỗi:\n{err}"))
+                
+        messagebox.showinfo("Đang kiểm tra", "Đang gửi tín hiệu thử nghiệm đến Google Gemini... Vui lòng đợi.")
+        import threading
+        threading.Thread(target=_run_test, daemon=True).start()
 
     def _save(self):
         data = {k: v.get().strip() for k, v in self._vars.items() if v.get().strip()}

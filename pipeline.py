@@ -24,6 +24,7 @@ from src.vocal_separator import separate_vocals
 from src.video_merger import merge_video
 from src.srt_generator import generate_srt
 from src.content_generator import generate_content
+from src.ai_subtitle_blur import apply_ai_blur
 
 logger = setup_logging("pipeline")
 
@@ -164,10 +165,11 @@ def parse_args() -> argparse.Namespace:
         help="Resume a previous run inside the given work directory. "
              "Skips already-completed steps based on cached artifacts.",
     )
+
     parser.add_argument(
-        "--blur-region",
-        default=None,
-        help="Frosted-glass blur region to cover original subtitles. Format: X:Y:W:H in video pixels.",
+        "--ai-blur",
+        action="store_true",
+        help="Use AI (YOLO/EasyOCR) to automatically detect and blur Chinese subtitles.",
     )
 
     args = parser.parse_args()
@@ -244,7 +246,7 @@ def run_pipeline(
     burn_subtitles: bool = False,
     subtitle_y: float = 72.0,
     subtitle_size: int = 38,
-    blur_region: tuple | None = None,
+    ai_blur: bool = False,
 ) -> dict:
     start_time = time.time()
 
@@ -271,6 +273,7 @@ def run_pipeline(
     logger.info("STEP 1: Acquiring video")
     video_path = _resolve_video(work_dir, url, file_path)
     logger.info(f"Video: {video_path}")
+
 
     # --- Step 2: Extract audio ---
     logger.info("=" * 60)
@@ -303,14 +306,28 @@ def run_pipeline(
     elif bg_mode == "none":
         logger.info("STEP 2.5 skipped: --bg-mode=none, dubbed audio uses silent base")
 
-    # --- Step 3: Speech-to-Text (ASR) ---
+    # --- Step 3: Speech-to-Text (ASR) & AI Subtitle Blur ---
     logger.info("=" * 60)
+    
+    if ai_blur:
+        logger.info("STEP 3A: Applying AI Subtitle Blur")
+        blurred_video_path = os.path.join(work_dir, "video_ai_blurred.mp4")
+        if os.path.exists(blurred_video_path) and os.path.getsize(blurred_video_path) > 0:
+            logger.info(f"Reusing existing AI blurred video: {blurred_video_path}")
+            video_path = blurred_video_path
+        else:
+            success = apply_ai_blur(video_path, blurred_video_path)
+            if success:
+                video_path = blurred_video_path
+            else:
+                logger.error("AI blur failed, continuing with original video.")
+                
     if os.path.exists(transcript_orig_path):
-        logger.info(f"STEP 3: Reusing existing transcript: {transcript_orig_path}")
+        logger.info(f"STEP 3B: Reusing existing transcript: {transcript_orig_path}")
         with open(transcript_orig_path, encoding="utf-8") as f:
             segments = json.load(f)
     else:
-        logger.info("STEP 3: Transcribing audio (ASR)")
+        logger.info("STEP 3B: Transcribing audio (ASR)")
         segments = transcribe(audio_path, lang_code)
         save_transcript(segments, transcript_orig_path)
         generate_srt(segments, os.path.join(work_dir, "transcript_original.srt"), text_field="text")
@@ -403,7 +420,6 @@ def run_pipeline(
             srt_path=srt_file,
             y_pixel=subtitle_y,
             font_size=subtitle_size,
-            blur_region=blur_region,
         )
 
     # --- Step 8: Generate thumbnails + YouTube metadata ---
@@ -494,7 +510,7 @@ def main():
             burn_subtitles=args.burn_subtitles,
             subtitle_y=args.subtitle_y,
             subtitle_size=args.subtitle_size,
-            blur_region=tuple(int(v) for v in args.blur_region.split(":")) if args.blur_region else None,
+            ai_blur=args.ai_blur,
         )
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)

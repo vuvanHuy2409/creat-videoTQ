@@ -99,3 +99,67 @@ def translate_segments_jp(segments: list[dict], source_lang: str) -> list[dict]:
         seg["text_jp"] = trans
 
     return segments
+
+
+def translate_json_openai(json_text: str, target_lang: str) -> str:
+    """Translate the 'text' field in the JSON transcript using OpenAI API."""
+    from config import OPENAI_API_KEY, OPENAI_MODEL_ID
+    
+    # Fallback / backward compatibility: check OPENAI_API_KEY first, fallback to GOOGLE_API_KEY if user hasn't set OPENAI_API_KEY
+    api_key = OPENAI_API_KEY
+    if not api_key:
+        raise ValueError("Lỗi: Không tìm thấy OPENAI_API_KEY trong file .env hoặc config.py. Vui lòng thêm OPENAI_API_KEY vào .env.")
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError("Lỗi: Thư viện 'openai' chưa được cài đặt. Vui lòng chạy: pip install openai")
+
+    system_prompt = (
+        f"You are a professional video subtitling translator. "
+        f"Translate the 'text' field in the provided JSON array into {target_lang}. "
+        f"Maintain natural, conversational tone appropriate for video dubbing. "
+        f"Return ONLY valid JSON array with the exact same structure, preserving 'id', 'start', 'end', 'duration' fields. "
+        f"Do not include markdown code block formatting (like ```json), commentary, or extra keys."
+    )
+
+    prompt = f"JSON to translate:\n{json_text}"
+
+    client = OpenAI(api_key=api_key)
+    model = OPENAI_MODEL_ID or "gpt-4o"
+
+    import time
+    import re
+
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"} if "gpt-4" in model or "gpt-3.5" in model or "o1" in model or "o3" in model else None
+            )
+            text = response.choices[0].message.content.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            return text.strip()
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                wait_time = 5.0
+                logger.warning(f"Quá tải API OpenAI. Đang chờ {wait_time} giây để thử lại (Lần {attempt+1}/3)...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"OpenAI translation failed: {e}")
+                raise RuntimeError(f"Lỗi khi gọi API OpenAI:\n{e}")
+
+
+# Alias for backward compatibility
+translate_json_gemini = translate_json_openai
+

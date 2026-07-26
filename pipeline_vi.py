@@ -26,6 +26,7 @@ from src.video_merger import merge_video
 from src.translate_pending import write_hint as _write_translate_pending_hint
 from src.srt_generator import generate_srt
 from src.content_generator import generate_content
+from src.ai_subtitle_blur import apply_ai_blur
 
 logger = setup_logging("pipeline_vi")
 
@@ -177,10 +178,11 @@ def parse_args() -> argparse.Namespace:
         metavar="WORK_DIR",
         help="Resume an existing work directory. Steps whose outputs already exist are skipped.",
     )
+
     parser.add_argument(
-        "--blur-region",
-        default=None,
-        help="Frosted-glass blur region to cover original subtitles. Format: X:Y:W:H in video pixels.",
+        "--ai-blur",
+        action="store_true",
+        help="Use AI (YOLO/EasyOCR) to automatically detect and blur Chinese subtitles.",
     )
     parser.add_argument(
         "--bg-mode",
@@ -298,8 +300,8 @@ def run_pipeline_vi(
     burn_subtitles: bool = False,
     ocr_replace: bool = False,
     subtitle_y: float = 72.0,
-    subtitle_size: int = 38,
-    blur_region: tuple | None = None,
+    subtitle_size: int = 40,
+    ai_blur: bool = False,
 ) -> dict:
     start_time = time.time()
 
@@ -328,13 +330,14 @@ def run_pipeline_vi(
     video_path = _resolve_video(work_dir, url, file_path)
     logger.info(f"Video: {video_path}")
 
+
     # --- Step 2: Extract audio ---
     logger.info("=" * 60)
     logger.info("STEP 2: Extracting audio")
-    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-        logger.info(f"Reusing existing audio: {audio_path}")
-    else:
+    if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
         extract_audio(video_path, audio_path)
+    else:
+        logger.info(f"Reusing existing audio: {audio_path}")
 
     # --- Step 2.5: Resolve background track for the dub merge ---
     background_path: str | None = None
@@ -368,6 +371,8 @@ def run_pipeline_vi(
             segments = json.load(f)
         logger.info(f"Loaded {len(segments)} segments from cache")
     else:
+        if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
+            extract_audio(video_path, audio_path)
         segments = transcribe(audio_path, lang_code)
         save_transcript(segments, transcript_orig_path)
         generate_srt(segments, os.path.join(work_dir, "transcript_original.srt"), text_field="text")
@@ -376,18 +381,46 @@ def run_pipeline_vi(
     # --- Step 4: Translate to Vietnamese ---
     logger.info("=" * 60)
     logger.info("STEP 4: Translating to Vietnamese")
+    is_valid_translation = False
     if os.path.exists(transcript_vi_path):
-        logger.info(f"Reusing existing translation: {transcript_vi_path}")
         with open(transcript_vi_path, encoding="utf-8") as f:
-            segments = json.load(f)
-        # Generate the translated SRT file
+            cached_segments = json.load(f)
+            if cached_segments and any("text_vi" in seg for seg in cached_segments):
+                segments = cached_segments
+                is_valid_translation = True
+
+    if is_valid_translation:
+        logger.info(f"Reusing existing translation: {transcript_vi_path}")
         generate_srt(segments, os.path.join(work_dir, "transcript_vi.srt"), text_field="text_vi")
     else:
-        # Save a placeholder copy of the original transcript
-        shutil.copy2(transcript_orig_path, transcript_vi_path)
-        _write_translate_pending_hint(work_dir, "vi-VN", source_lang)
-        logger.warning("Translation pending — see TRANSLATE_PENDING.txt in work dir")
-        return {"status": "translate_pending", "work_dir": work_dir}
+        from src.translator import translate_segments_vi
+        try:
+            logger.info(f"Automatically translating {len(segments)} segments to Vietnamese...")
+            segments = translate_segments_vi(segments, source_lang)
+            save_transcript(segments, transcript_vi_path)
+            generate_srt(segments, os.path.join(work_dir, "transcript_vi.srt"), text_field="text_vi")
+            logger.info("Automatic translation completed and saved to transcript_vi.json")
+        except Exception as e:
+            logger.error(f"Automatic translation failed: {e}")
+            shutil.copy2(transcript_orig_path, transcript_vi_path)
+            _write_translate_pending_hint(work_dir, "vi-VN", source_lang)
+            return {"status": "translate_pending", "work_dir": work_dir}
+
+    # --- Step 4B: AI Subtitle Blur (chạy sau khi dịch xong, trước TTS) ---
+    logger.info("=" * 60)
+    if ai_blur:
+        logger.info("STEP 4B: Applying AI Subtitle Blur")
+        blurred_video_path = os.path.join(work_dir, "video_ai_blurred.mp4")
+        if os.path.exists(blurred_video_path) and os.path.getsize(blurred_video_path) > 0:
+            logger.info(f"Reusing existing AI blurred video: {blurred_video_path}")
+            video_path = blurred_video_path
+        else:
+            success = apply_ai_blur(video_path, blurred_video_path, ocr_every_n_frames=2)
+            if success:
+                video_path = blurred_video_path
+                logger.info("AI subtitle blur completed successfully.")
+            else:
+                logger.error("AI blur failed, continuing with original video.")
 
     # --- Step 5: TTS for each segment (LucyLab API) ---
     logger.info("=" * 60)
@@ -464,11 +497,25 @@ def run_pipeline_vi(
         background_gain_db=0.5,
     )
 
-    # --- Step 7: Merge video (optional) ---
-    dubbed_video_path = None
-    if not skip_video:
+    # --- Step 7: Merge audio & video ---
+    if skip_video:
+        logger.info("Skipping video merge (--skip-video)")
+        dubbed_video_path = None
+    else:
         logger.info("=" * 60)
-        logger.info("STEP 7: Creating dubbed video")
+        logger.info("STEP 7: Merging audio, video, and subtitle")
+        
+        # Đọc toạ độ Y tự động do AI Subtitle Blur phân tích (nếu có)
+        y_pos_file = os.path.join(work_dir, "subtitle_y_pos.txt")
+        if os.path.exists(y_pos_file):
+            try:
+                with open(y_pos_file, "r") as f:
+                    auto_y = float(f.read().strip())
+                    subtitle_y = auto_y
+                    logger.info(f"Using auto-detected subtitle Y position: {subtitle_y}")
+            except Exception as e:
+                logger.warning(f"Failed to read subtitle_y_pos.txt: {e}")
+
         dubbed_video_path = os.path.join(work_dir, "dubbed_video.mp4")
         srt_vi = os.path.join(work_dir, "transcript_vi.srt")
         if ocr_replace:
@@ -480,7 +527,6 @@ def run_pipeline_vi(
                 srt_path=srt_vi,
                 y_pixel=subtitle_y,
                 font_size=subtitle_size,
-                blur_region=blur_region,
             )
         elif burn_subtitles:
             merge_video(
@@ -490,7 +536,6 @@ def run_pipeline_vi(
                 srt_path=srt_vi,
                 y_pixel=subtitle_y,
                 font_size=subtitle_size,
-                blur_region=blur_region,
             )
         else:
             merge_video(
@@ -499,7 +544,6 @@ def run_pipeline_vi(
                 output_path=dubbed_video_path,
                 y_pixel=subtitle_y,
                 font_size=subtitle_size,
-                blur_region=blur_region,
             )
 
     # --- Step 8: Generate thumbnails + YouTube metadata ---
@@ -592,11 +636,13 @@ def main():
             ocr_replace=args.ocr_replace,
             subtitle_y=args.subtitle_y,
             subtitle_size=args.subtitle_size,
-            blur_region=tuple(int(v) for v in args.blur_region.split(":")) if args.blur_region else None,
+            ai_blur=args.ai_blur,
         )
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
-        sys.exit(1)
+        os._exit(1)
+        
+    os._exit(0)
 
 
 if __name__ == "__main__":

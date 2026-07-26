@@ -17,6 +17,13 @@ def normalize_url(url: str) -> str:
     if not url:
         return url
     url = url.strip()
+    
+    # Bóc tách URL thực sự nếu người dùng dán cả đoạn văn bản (Share text từ Douyin)
+    import re
+    m = re.search(r"https?://[^\s]+", url)
+    if m:
+        url = m.group(0)
+
     parsed = urlparse(url)
     host = parsed.netloc.lower()
 

@@ -1,0 +1,8 @@
+2026/07/25-16:13:06.925 4e326b Reusing MANIFEST /Users/mac/Desktop/Auto-Translade-video/playwright_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/07/25-16:13:06.928 4e326b Recovering log #90
+2026/07/25-16:13:06.928 4e326b Level-0 table #93: started
+2026/07/25-16:13:06.933 4e326b Level-0 table #93: 25005 bytes OK
+2026/07/25-16:13:06.933 4e326b Recovering log #93
+2026/07/25-16:13:06.934 4e326b Reusing old log /Users/mac/Desktop/Auto-Translade-video/playwright_profile/Default/Local Storage/leveldb/000093.log 
+2026/07/25-16:13:06.938 4e326b Delete type=0 #90
+2026/07/25-16:13:06.938 4e326b Delete type=2 #94

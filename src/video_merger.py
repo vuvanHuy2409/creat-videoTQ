@@ -57,6 +57,8 @@ def _parse_srt(srt_path: str) -> list[dict]:
                 end   = h2*3600 + m2*60 + s2 + ms2/1000.0
                 text  = " ".join(lines[i+1:]).strip()
                 text  = re.sub(r"<[^>]+>", "", text)
+                import unicodedata
+                text  = unicodedata.normalize('NFC', text)
                 if text:
                     entries.append({"start": start, "end": end, "text": text})
                 break
@@ -146,13 +148,17 @@ def _escape_subtitles_path(path: str) -> str:
     return path.replace("\\", "/").replace(":", "\\:")
 
 
-def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: int, y_pixel: float, font_size: int = 38) -> None:
-    """Write subtitle entries into a v4.00+ ASS file with white bold text and black outlines."""
+def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: int, y_pixel: float, font_size: int = 40) -> None:
+    """Write subtitle entries into a v4.00+ ASS file.
+    y_pixel = vertical centre of the subtitle zone (pixels from top of frame).
+    Alignment 2 = bottom-centre; MarginV = distance from bottom of frame to bottom of text.
+    To centre text at y_pixel: margin_v = frame_h - (y_pixel + font_size//2)
+    """
     if y_pixel >= frame_h or y_pixel <= 0:
-        y_pixel = int(frame_h * 0.72)
-    margin_v = int(frame_h - y_pixel)
-    if margin_v < 10:
-        margin_v = 10
+        y_pixel = int(frame_h * 0.85)
+    margin_v = int(frame_h - (y_pixel + font_size // 2))
+    if margin_v < 4:
+        margin_v = 4
 
     def fmt(sec: float) -> str:
         h = int(sec // 3600)
@@ -214,10 +220,12 @@ def _find_bold_font() -> str | None:
     return None
 
 
-def _build_drawtext_filter(chunks: list[dict], frame_h: int = 1080, y_pixel: float = 780.0, font_size: int = 38) -> str:
+def _build_drawtext_filter(chunks: list[dict], frame_h: int = 1080, y_pixel: float = 780.0, font_size: int = 40) -> str:
     """Build a chained drawtext filter for all subtitle chunks with white text and black borders."""
     if y_pixel >= frame_h or y_pixel <= 0:
-        y_pixel = int(frame_h * 0.72)
+        y_pixel = int(frame_h * 0.85)
+    # y_pixel = vertical centre; drawtext y anchors at top of text, so shift up by half font height
+    y_top = max(0, int(y_pixel) - font_size // 2)
     font_path = _find_bold_font()
     filters   = []
 
@@ -226,7 +234,7 @@ def _build_drawtext_filter(chunks: list[dict], frame_h: int = 1080, y_pixel: flo
         text  = _escape_drawtext(chunk['text'])
         start = chunk["start"]
         end   = chunk["end"]
-        y_expr = str(int(y_pixel))
+        y_expr = str(y_top)   # top of text = y_center - half_font → text centered at y_pixel
 
         parts = [
             f"text='{text}'",
@@ -247,62 +255,15 @@ def _build_drawtext_filter(chunks: list[dict], frame_h: int = 1080, y_pixel: flo
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def _build_blur_region_vf(region: tuple, vf_chain: str | None) -> str:
-    """
-    Build an ffmpeg complex filter chain that:
-      1. Crops a thin slice of height 16px from just above the selected region.
-      2. Stretches/scales this slice vertically to the full height of the selected region.
-      3. Blurs it (gblur or safe boxblur) to smooth out any textures.
-      4. Overlays this stretched strip back at the selected position, making it look
-         like a natural continuation of the video background (hiding subtitles).
-    Then appends any existing subtitle/drawtext filter chain.
-
-    region: (x, y, w, h) in original video pixels.
-    vf_chain: existing vf string (subtitles/drawtext) or None.
-    Returns the combined filter string for -filter_complex.
-    """
-    x, y, w, h = int(region[0]), int(region[1]), int(region[2]), int(region[3])
-    w = max(w, 2)
-    h = max(h, 2)
-
-    # Determine source slice just above the region (or below if y is near 0)
-    slice_h = 16
-    if y >= slice_h:
-        y_src = y - slice_h
-    else:
-        y_src = y + h
-
-    if _has_filter("gblur"):
-        blur_filter = "gblur=sigma=10:steps=2"
-    else:
-        safe_r = max(1, min(w, h) // 4 - 1)
-        safe_r = min(safe_r, 24)
-        blur_filter = f"boxblur=luma_radius={safe_r}:luma_power=2:chroma_radius={safe_r}:chroma_power=2"
-
-    # Crop the 16px strip from y_src, scale/stretch it to w:h, apply blur, and overlay at x:y
-    blur_vf = (
-        f"[0:v]split=2[_main][_src];"
-        f"[_src]crop={w}:{slice_h}:{x}:{y_src},scale={w}:{h},{blur_filter}[_stretched];"
-        f"[_main][_stretched]overlay={x}:{y}"
-    )
-    if vf_chain:
-        return blur_vf + f",{vf_chain}[outv]"
-    return blur_vf + "[outv]"
-
-
 def merge_video(video_path: str, audio_path: str, output_path: str,
                 srt_path: str | None = None, y_pixel: float = 780.0,
-                font_size: int = 38,
-                blur_region: tuple | None = None) -> str:
+                font_size: int = 40) -> str:
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio not found: {audio_path}")
 
     logger.info(f"Using FFmpeg: {FFMPEG_BIN}")
-    if blur_region:
-        logger.info(f"Frosted-glass blur region: x={blur_region[0]}, y={blur_region[1]}, "
-                    f"w={blur_region[2]}, h={blur_region[3]}")
 
     cmd = [FFMPEG_BIN, "-i", video_path, "-i", audio_path]
 
@@ -337,12 +298,9 @@ def merge_video(video_path: str, audio_path: str, output_path: str,
             project_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
             escaped_fontsdir = project_dir.replace("\\", "/").replace(":", "\\:")
             subtitle_vf = f"subtitles=filename='{escaped}':fontsdir='{escaped_fontsdir}'"
-            if blur_region:
-                vf = _build_blur_region_vf(blur_region, subtitle_vf)
-            else:
-                vf = subtitle_vf
+            vf = subtitle_vf
             cmd += [
-                "-filter_complex" if blur_region else "-vf", vf,
+                "-vf", vf,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             ]
             logger.info("  Using subtitles filter (libass) with chunked ASS")
@@ -355,35 +313,21 @@ def merge_video(video_path: str, audio_path: str, output_path: str,
             cap.release()
 
             subtitle_vf = _build_drawtext_filter(chunks, frame_h, y_pixel, font_size)
-            if blur_region:
-                vf = _build_blur_region_vf(blur_region, subtitle_vf)
-            else:
-                vf = subtitle_vf
+            vf = subtitle_vf
             cmd += [
-                "-filter_complex" if blur_region else "-vf", vf,
+                "-vf", vf,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22"
             ]
             logger.info(f"  Using drawtext filter ({len(chunks)} chunks)")
 
         # ── Option 3: no text filter available ───────────────────────────────
         else:
-            if blur_region:
-                vf = _build_blur_region_vf(blur_region, None)
-                cmd += ["-filter_complex", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
-            else:
-                logger.warning("No drawtext/subtitles filter available - skipping all overlays")
-                cmd += ["-c:v", "copy"]
-    else:
-        if blur_region:
-            vf = _build_blur_region_vf(blur_region, None)
-            cmd += ["-filter_complex", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
-        else:
+            logger.warning("No drawtext/subtitles filter available - skipping all overlays")
             cmd += ["-c:v", "copy"]
-
-    if blur_region:
-        cmd += ["-map", "[outv]", "-map", "1:a", "-y", output_path]
     else:
-        cmd += ["-map", "0:v", "-map", "1:a", "-y", output_path]
+        cmd += ["-c:v", "copy"]
+
+    cmd += ["-map", "0:v", "-map", "1:a", "-y", output_path]
 
     logger.info(f"Merging video + audio → {output_path}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -471,17 +415,16 @@ def merge_video_with_ocr_replace(
     output_path: str,
     srt_path: str,
     y_pixel: float = 780.0,
-    font_size: int = 38,
-    blur_region: tuple | None = None,
+    subtitle_size: int = 40,
 ) -> str:
     """OCR replace mode has been deprecated and replaced by manual Y-pixel placement replacement."""
-    logger.info(f"OCR Replace mode active: using manual Y-pixel replace at {y_pixel}px, size={font_size}px")
+    logger.info(f"OCR Replace mode active: using manual Y-pixel replace at {y_pixel}px, size={subtitle_size}px")
     return merge_video(
         video_path=video_path,
         audio_path=audio_path,
         output_path=output_path,
         srt_path=srt_path,
         y_pixel=y_pixel,
-        font_size=font_size,
-        blur_region=blur_region,
+        font_size=subtitle_size,
     )
+

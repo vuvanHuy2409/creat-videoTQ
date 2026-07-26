@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auto Translate Video</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo">
+                <h2>AutoDub</h2>
+            </div>
+            <nav>
+                <a href="#" class="nav-item active" data-tab="dashboard">Bảng điều khiển</a>
+                <a href="#" class="nav-item" data-tab="new_project">Dự án mới</a>
+                <a href="#" class="nav-item" data-tab="settings">Cài đặt</a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="content">
+            
+            <!-- Dashboard Tab -->
+            <section id="tab-dashboard" class="tab-content active">
+                <header>
+                    <h1>Dự án gần đây</h1>
+                    <button class="btn btn-primary" onclick="switchTab('new_project')">Tạo dự án mới</button>
+                </header>
+                <div class="projects-grid" id="projects-container">
+                    <!-- Projects injected here via JS -->
+                </div>
+            </section>
+
+            <!-- New Project Tab -->
+            <section id="tab-new_project" class="tab-content">
+                <header>
+                    <h1>Dự án mới</h1>
+                </header>
+                
+                <div class="wizard-container">
+                    <!-- Stepper -->
+                    <div class="stepper">
+                        <div class="step active" id="step-nav-1">1. Thiết lập</div>
+                        <div class="step" id="step-nav-2">2. Chạy ASR</div>
+                        <div class="step" id="step-nav-3">3. Dịch thuật</div>
+                        <div class="step" id="step-nav-4">4. Lồng tiếng</div>
+                    </div>
+
+                    <div class="wizard-content">
+                        <!-- Step 1: Setup -->
+                        <div class="step-pane active" id="step-pane-1">
+                            <div class="form-group">
+                                <label>Đường dẫn Video (.mp4):</label>
+                                <input type="text" id="video_path" class="input" placeholder="/Users/mac/Desktop/video.mp4">
+                            </div>
+                            <div class="form-group">
+                                <label>Ngôn ngữ dịch sang:</label>
+                                <select id="target_lang" class="input">
+                                    <option value="Tiếng Việt (lồng tiếng, dịch sub, subtitle burn)">Tiếng Việt (lồng tiếng, dịch sub, subtitle burn)</option>
+                                </select>
+                            </div>
+                            <div class="form-group checkbox-group">
+                                <label><input type="checkbox" id="ai_blur" checked> AI xoá mờ phụ đề cũ</label>
+                                <label><input type="checkbox" id="burn_subtitles" checked> Gắn cứng phụ đề mới vào video</label>
+                            </div>
+                            <div class="wizard-actions">
+                                <button class="btn btn-primary" onclick="startASR()">Tiếp tục (Chạy ASR) &rarr;</button>
+                            </div>
+                        </div>
+
+                        <!-- Step 2: ASR Terminal -->
+                        <div class="step-pane" id="step-pane-2">
+                            <p class="desc">Hệ thống đang trích xuất âm thanh và nhận diện giọng nói...</p>
+                            <div class="terminal-container">
+                                <div class="terminal-body" id="terminal-asr">Chờ khởi động...</div>
+                            </div>
+                            <div class="wizard-actions mt-4">
+                                <button class="btn btn-outline" id="btn-next-step3" onclick="goToStep(3)" disabled>Tiếp tục (Chỉnh sửa dịch thuật) &rarr;</button>
+                            </div>
+                        </div>
+
+                        <!-- Step 3: Translation Edit -->
+                        <div class="step-pane" id="step-pane-3">
+                            <p class="desc">Vui lòng kiểm tra và chỉnh sửa bản dịch JSON bên dưới:</p>
+                            <textarea id="transcript_json" class="textarea" rows="12"></textarea>
+                            
+                            <div class="grid-2 mt-4">
+                                <div class="form-group">
+                                    <label>Giọng đọc AI:</label>
+                                    <select id="voice_selection" class="input">
+                                        <option value="female">vi-VN-HoaiMyNeural (Nữ)</option>
+                                        <option value="male">vi-VN-NamMinhNeural (Nam)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Cỡ chữ phụ đề:</label>
+                                    <select id="subtitle_size" class="input">
+                                        <option value="40">40 (Khuyến nghị)</option>
+                                        <option value="35">35 (Vừa)</option>
+                                        <option value="50">50 (To)</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="wizard-actions">
+                                <button class="btn btn-primary" onclick="startTTS()">Tiếp tục (Lồng tiếng) &rarr;</button>
+                            </div>
+                        </div>
+
+                        <!-- Step 4: TTS Terminal -->
+                        <div class="step-pane" id="step-pane-4">
+                            <p class="desc">Hệ thống đang tổng hợp giọng nói và ghép video...</p>
+                            <div class="terminal-container">
+                                <div class="terminal-body" id="terminal-tts">Chờ khởi động...</div>
+                            </div>
+                            <div class="wizard-actions mt-4">
+                                <button class="btn btn-success" id="btn-finish" onclick="switchTab('dashboard')" disabled>Hoàn tất & Về trang chủ</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Settings Tab -->
+            <section id="tab-settings" class="tab-content">
+                <header>
+                    <h1>Cài đặt</h1>
+                </header>
+                <div class="card">
+                    <div class="form-group">
+                        <label>OpenAI API Key (Dịch thuật):</label>
+                        <input type="password" id="openai_key" class="input">
+                    </div>
+                    <div class="form-group mt-4">
+                        <label>Google Gemini API Key (Mô tả & Thu nhỏ):</label>
+                        <input type="password" id="gemini_key" class="input">
+                    </div>
+                    <div class="actions mt-4">
+                        <button class="btn btn-outline" onclick="testGemini()">Thử kết nối Gemini</button>
+                        <button class="btn btn-primary" onclick="saveSettings()">Lưu cài đặt</button>
+                    </div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

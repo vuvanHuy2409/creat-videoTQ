@@ -1,0 +1,11 @@
+# Class names cho dataset chữ Trung Quốc
+# Chỉ có 1 class: "chinese_text" (vùng chứa chữ Trung)
+nc: 1
+names:
+  - chinese_text
+
+# Đường dẫn dataset (sẽ được tạo bởi prepare_dataset.py)
+path: ./dataset
+train: images/train
+val:   images/val
+test:  images/test

@@ -9,6 +9,8 @@ def generate_srt(segments: list[dict], output_path: str, text_field: str = "text
         start_ts = format_timestamp(seg["start"])
         end_ts = format_timestamp(seg["end"])
         text = seg.get(text_field, seg.get("text", ""))
+        import unicodedata
+        text = unicodedata.normalize('NFC', text)
         lines.append(f"{i}\n{start_ts} --> {end_ts}\n{text}\n")
 
     import os

@@ -58,7 +58,10 @@ def separate_vocals(
         logger.warning(f"Demucs separation failed: {exc}; falling back to silent base.")
         for path in (raw_vocals, raw_no_vocals):
             if os.path.exists(path):
-                os.remove(path)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         return {"vocals": None, "no_vocals": None}
 
     sample_rate = str(config.AUDIO_SAMPLE_RATE)
@@ -69,12 +72,18 @@ def separate_vocals(
         logger.warning(f"Post-processing Demucs output failed: {exc}")
         for path in (vocals_out, no_vocals_out):
             if os.path.exists(path):
-                os.remove(path)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         return {"vocals": None, "no_vocals": None}
     finally:
         for path in (raw_vocals, raw_no_vocals):
             if os.path.exists(path):
-                os.remove(path)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     logger.info(f"Vocal separation complete: {no_vocals_out}")
     return {"vocals": vocals_out, "no_vocals": no_vocals_out}

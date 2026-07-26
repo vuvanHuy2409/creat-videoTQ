@@ -149,13 +149,18 @@ Respond in this exact JSON format (no markdown code blocks):
             break
         except Exception as e:
             error_str = str(e)
-            is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "ServerError" in type(e).__name__
+            is_transient = "503" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "UNAVAILABLE" in error_str or "ServerError" in type(e).__name__
             if is_transient and attempt < max_retries - 1:
-                wait = (attempt + 1) * 15  # 15s, 30s, 45s, 60s
-                logger.warning(f"Metadata API error, retrying in {wait}s (attempt {attempt + 1}/{max_retries}): {error_str[:80]}")
+                wait = (attempt + 1) * 20  # 20s, 40s, 60s, 80s
+                logger.warning(f"Metadata API rate limit/error, retrying in {wait}s (attempt {attempt + 1}/{max_retries}): {error_str[:120]}")
                 time.sleep(wait)
             else:
-                raise
+                logger.error(f"Gemini metadata generation failed: {e}")
+                return {
+                    "title": "Video",
+                    "description": script_translated[:500] if script_translated else "",
+                    "hashtags": [],
+                }
 
     text = response.text.strip()
     text = re.sub(r"^```json\s*", "", text)

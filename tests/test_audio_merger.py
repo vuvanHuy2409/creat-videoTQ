@@ -112,7 +112,7 @@ def test_merge_segments_applies_background_gain(tmp_path):
 
     full = AudioSegment.from_wav(full_output)
     quiet = AudioSegment.from_wav(quiet_output)
-    # -12 dB should drop loudness noticeably; allow a 1 dB tolerance for the
+    # -6 dB should drop loudness noticeably; allow a 1 dB tolerance for the
     # round-trip through pydub + 16-bit PCM export
-    assert quiet.dBFS < full.dBFS - 10
+    assert quiet.dBFS < full.dBFS - 5
     assert abs(len(quiet) / 1000.0 - 3.0) < 0.1

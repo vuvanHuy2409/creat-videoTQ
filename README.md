@@ -1,186 +1,177 @@
-# Auto-Translade-video
+# Auto-Translade-video 🎬🤖
 
-Tự động lồng tiếng video (YouTube / TikTok / Douyin / file local) sang **tiếng Việt** hoặc **tiếng Nhật**, giữ nguyên nhạc nền và hiệu ứng âm thanh gốc.
-
-## Pipeline
-
-```
-URL/file → Download → Extract audio → (Demucs tách BGM)
-        → ASR (Azure Speech) → Dịch sang VI/JP (skill hoặc web AI)
-        → TTS (LucyLab cho VI, Azure cho JP)
-        → Khớp timeline → Mix với BGM → Ghép vào video
-```
-
-## Yêu cầu
-
-- Python 3.10+
-- `ffmpeg` trong PATH
-- Tài khoản **Azure Speech** (ASR + JP TTS)
-- Tài khoản **LucyLab** (chỉ cần nếu lồng VI) – https://lucylab.io
-- (Tuỳ chọn) Google Gemini API key (để tự sinh metadata YouTube + thumbnail)
-
-```bash
-pip install -r requirements.txt
-playwright install chromium      # cần cho download Douyin
-cp .env.example .env             # rồi điền key vào
-```
-
-## Hướng dẫn cấu hình file `.env`
-
-Để ứng dụng hoạt động, bạn cần sao chép file `.env.example` thành `.env` và điền đầy đủ các thông tin cấu hình API dưới đây:
-
-### 1. Azure Speech Service (Cần thiết cho Nhận dạng ASR & Lồng tiếng Nhật)
-*   **Tác dụng**: Dùng để chuyển giọng nói trong video thành văn bản (ASR) và lồng tiếng Nhật (TTS).
-*   **Cách lấy API Key & Region**:
-    1. Truy cập [Microsoft Azure Portal](https://portal.azure.com/) và đăng nhập tài khoản.
-    2. Tìm kiếm và chọn dịch vụ **Speech** (hoặc tạo một tài nguyên **Azure Cognitive Services**).
-    3. Chọn gói cước (Gói **Free F0** là đủ cho nhu cầu cá nhân/thử nghiệm, hoặc gói Pay-as-you-go).
-    4. Sau khi tài nguyên được khởi tạo thành công, truy cập vào mục **Keys and Endpoint** ở menu bên trái.
-    5. Sao chép một trong hai Key (`KEY 1` hoặc `KEY 2`) dán vào biến `AZURE_SPEECH_KEY`.
-    6. Sao chép giá trị **Location/Region** (ví dụ: `japaneast`, `eastus`) dán vào biến `AZURE_SPEECH_REGION`.
-
-### 2. Vietnamese TTS - LucyLab API (Cần thiết nếu lồng tiếng Việt)
-*   **Tác dụng**: Dùng để lồng tiếng Việt chất lượng cao bằng giọng đọc AI tự nhiên.
-*   **Cách lấy API Key & Voice ID**:
-    1. Truy cập website lồng tiếng Việt [LucyLab.io](https://lucylab.io/) (hoặc nền tảng VietSpeech).
-    2. Đăng ký tài khoản và đăng nhập.
-    3. Vào mục **API Key / Developer Settings** trong trang cá nhân của bạn để tạo và sao chép mã khóa API. Dán mã này vào biến `VIETNAMESE_API_KEY`.
-    4. Tìm kiếm danh sách Voice ID có sẵn trên LucyLab và dán mã giọng đọc nam vào `VIETNAMESE_VOICEID_MALE` (ví dụ: `2LLtWibYKJaiLFeqVkzPGY`) và mã giọng đọc nữ vào `VIETNAMESE_VOICEID_FEMALE` (ví dụ: `mhsL3CPLxmLYdSTKp3GANz`).
-    5. Giữ nguyên địa chỉ API URL mặc định: `LUCYLAB_API_URL=https://api.lucylab.io/json-rpc`.
-
-### 3. Google Gemini API Key (Tùy chọn)
-*   **Tác dụng**: Dùng để tự động dịch thuật và phân tích video, viết tiêu đề/mô tả/thẻ tag YouTube và tự động tạo gợi ý vẽ hình thu nhỏ (thumbnail prompts).
-*   **Cách lấy API Key**:
-    1. Truy cập [Google AI Studio](https://aistudio.google.com/).
-    2. Đăng nhập bằng tài khoản Google của bạn.
-    3. Nhấp vào nút **Get API Key** ở góc trên cùng bên trái màn hình.
-    4. Tạo một khóa API mới (miễn phí) và sao chép dán vào biến `GOOGLE_API_KEY`.
-
-### 4. Các thông số cấu hình chung khác
-*   `AUDIO_SLOW_FACTOR`: Tỷ lệ làm chậm và kéo dài phần âm thanh nhạc nền gốc (BGM) để tạo không gian trống lồng tiếng nói. Mặc định là `0.82` (chậm đi 18%), giữ nguyên nếu bạn muốn nhạc nền khớp tự nhiên nhất.
-*   `DEFAULT_SOURCE_LANG`: Ngôn ngữ nguồn mặc định của video gốc (ví dụ: `en-US` cho tiếng Anh, `zh-CN` cho tiếng Trung).
-*   `TTS_VOICE`: Tên mẫu giọng đọc tiếng Nhật mặc định sử dụng từ Azure (mặc định: `ja-JP-KeitaNeural`).
-*   `TTS_MAX_SPEED_RATIO`: Giới hạn tỷ lệ tăng tốc tối đa của giọng đọc tiếng Nhật (mặc định: `1.3`).
-*   `VIETNAMESE_TTS_MAX_SPEED`: Giới hạn tỷ lệ tăng tốc tối đa của giọng đọc tiếng Việt (mặc định: `1.3`).
-*   `AUDIO_SAMPLE_RATE`: Tần số lấy mẫu âm thanh phục vụ nhận dạng (mặc định: `16000`).
-*   `OUTPUT_DIR`: Thư mục chứa thư mục làm việc và video thành phẩm kết xuất ra (mặc định: `./output`).
+Hệ thống tự động chuyển ngữ và lồng tiếng video đa nền tảng (**YouTube / Douyin / TikTok / Video local**) sang **Tiếng Việt** hoặc **Tiếng Nhật**. Hệ thống có cả giao diện đồ họa (GUI) trực quan và giao diện dòng lệnh (CLI), hỗ trợ tự động tách nhạc nền (BGM), dịch tự động qua API (OpenAI/Gemini/Skill) và lồng tiếng khớp timeline.
 
 ---
 
-## Hai cách dịch — chọn 1
+## 🌟 Chức năng nổi bật & Quy trình 5 bước tự động
 
-Bước dịch transcript là bước **duy nhất** cần can thiệp tay. Sau khi ASR xong, pipeline tự dừng và tạo file `TRANSLATE_PENDING.txt` trong work dir, chứa hướng dẫn cụ thể cho cả 2 cách dưới.
+Hệ thống hoạt động theo quy trình 5 bước khép kín. Trên giao diện GUI, khi nhập link video và bắt đầu, hệ thống sẽ **tự động chạy xuyên suốt từ Bước 1 đến Bước 5** mà không cần dừng lại can thiệp:
 
-### Cách A — Người dùng Claude Code (full auto)
+1. **Bước 1: Nguồn Video (Download)**
+   - Hỗ trợ tải video tự động từ link YouTube, Douyin (bao gồm bypass captcha/browser profile qua Playwright), TikTok và hơn 1000+ website hỗ trợ bởi `yt-dlp`.
+   - Hỗ trợ tải hoặc kéo thả trực tiếp file video local (`.mp4`, `.mkv`, `.avi`, `.mov`).
+   - Tự động cắt video theo mốc thời gian (Trim start/end).
 
-Mở repo trong [Claude Code](https://claude.com/claude-code) và bảo:
+2. **Bước 2: Tách Âm Thanh & Nhận Diện Giọng Nói (ASR)**
+   - **Tách BGM**: Sử dụng **Demucs** (AI tách lời bài hát/nhạc nền chất lượng cao) hoặc chế độ **Audio Ducking** (giảm âm lượng giọng cũ) để giữ nguyên nhạc nền và hiệu ứng âm thanh gốc.
+   - **Cắt xén phụ đề cứng (Subtitle Crop)**: Cho phép kéo chọn vùng chứa phụ đề gốc trên video để xóa/che trước khi ghi phụ đề mới.
+   - **ASR**: Sử dụng **Azure Speech Service** để chuyển lời nói gốc thành dữ liệu phụ đề mốc thời gian (mã hóa JSON & SRT).
 
-> Translate the transcript at `output/VN/2026xxxx_vi` to Vietnamese.
+3. **Bước 3: Dịch Thuật Tự Động (AI Translation)**
+   - **Tự động dịch API**: Tự động chuyển phụ đề từ ngôn ngữ gốc (Anh, Trung, Nhật, ...) sang Tiếng Việt / Tiếng Nhật qua API OpenAI / Gemini.
+   - **Tự động chuyển bước**: Sau khi dịch xong bằng API, hệ thống **ngay lập tức chuyển sang Bước 4 & Bước 5** mà không bắt người dùng dừng lại thao tác thủ công.
+   - **Chỉnh sửa thủ công (Tùy chọn)**: Cho phép xem trước và chỉnh sửa lại câu từ trong file JSON dịch nếu muốn.
 
-Hoặc gọi skill trực tiếp:
+4. **Bước 4: Tổng Hợp Giọng Nói (TTS) & Ghép Video (Render)**
+   - **Lồng tiếng Việt**: Kết nối API **LucyLab / VietSpeech** với các giọng đọc nam/nữ AI tự nhiên (`male`, `female`).
+   - **Lồng tiếng Nhật**: Kết nối **Azure Neural Voice** (mặc định giọng `ja-JP-KeitaNeural`).
+   - **Khớp Timeline (Time-sync)**: Tự động điều chỉnh tốc độ đọc (atempo) khớp chính xác từng phân đoạn âm thanh gốc.
+   - **Subtitles Overlay**: Tự động gắn phụ đề dịch thẳng vào video kết xuất.
 
-```
-/translate-video-segments
-```
+5. **Bước 5: Hoàn Tất & Xuất Kết Quả**
+   - Kết xuất video lồng tiếng thành phẩm (`dubbed_video.mp4`).
+   - Phát âm thanh thông báo và hỗ trợ xem video trực tiếp, mở thư mục kết quả.
+   - Tự động tạo tiêu đề, mô tả, thẻ tag YouTube và gợi ý thumbnail bằng Gemini AI.
 
-Skill đọc `transcript_original.json`, dịch theo style rules (xem `.claude/skills/translate-video-segments/`), ghi `transcript_vi.json`. Pipeline tự resume.
+---
 
-Toàn bộ workflow từ link đến video xuất ra **chạy 1 lần — không cần can thiệp** vì Claude Code tự chạy `pipeline_vi.py` phase 1, gọi skill, rồi chạy `--resume`.
+## 🖥 Giao Diện Đồ Họa (GUI App)
 
-### Cách B — Không có Claude Code, không cần API key (ChatGPT / Gemini web)
-
-Khi pipeline dừng, mở `<work_dir>/TRANSLATE_PENDING.txt`. File này chứa sẵn một **prompt chuẩn** + hướng dẫn từng bước:
-
-1. Mở `transcript_original.json` trong work dir
-2. Mở ChatGPT hoặc Gemini (web). Bắt đầu chat mới
-3. Copy đoạn `----- PROMPT TO COPY -----` từ `TRANSLATE_PENDING.txt`, dán vào chat, dán tiếp nội dung `transcript_original.json` rồi gửi
-4. AI trả về một JSON array. Copy lại
-5. Lưu thành `transcript_vi.json` (UTF-8) cùng folder với `transcript_original.json`
-6. Chạy resume:
-
-   ```bash
-   python pipeline_vi.py --resume "<work_dir>" --file <video_gốc.mp4>
-   ```
-
-Pipeline phát hiện file dịch, skip bước dịch, tiếp tục TTS → mix → xuất video.
-
-> **Lưu ý:** prompt trong `TRANSLATE_PENDING.txt` đã bao gồm rules giọng văn YouTube (bạn/mình/các bạn, drop tiếng đệm 啊/呢/嘛, pinyin tên Trung, romanization tên Hàn), rules length-aware theo duration mỗi segment, và format JSON output strict.
-
-## Sử dụng
-
-### Lồng tiếng Việt
+Ứng dụng có giao diện Đồ họa đẹp mắt và dễ sử dụng bằng Python Tkinter (`app_gui.py`):
 
 ```bash
-# YouTube/Douyin URL
+python app_gui.py
+```
+
+### Các tính năng trên GUI:
+- **Tự động hóa hoàn toàn**: Nhập link video -> Nhấn bắt đầu -> Nhận video thành phẩm.
+- **Quản lý dự án**: Tự động lưu tiến độ vào `output/`, cho phép tải lại dự án cũ để làm tiếp bất cứ lúc nào.
+- **Bộ chọn dải phụ đề trực quan**: Kéo thả trên khung xem trước video để đặt vị trí xóa phụ đề cũ.
+- **Cấu hình giọng đọc & ngôn ngữ linh hoạt**.
+
+---
+
+## 🛠 Cài Đặt & Cấu Hình
+
+### 1. Yêu cầu môi trường
+- Python 3.10 trở lên
+- `ffmpeg` đã cài đặt và được thêm vào PATH
+- Tài khoản API:
+  - **Azure Speech Service** (bắt buộc cho ASR & TTS Tiếng Nhật)
+  - **LucyLab API** (bắt buộc nếu lồng Tiếng Việt) – [lucylab.io](https://lucylab.io)
+  - **OpenAI API Key / Google Gemini API Key** (dịch thuật tự động và tạo metadata)
+
+### 2. Cài đặt thư viện
+
+```bash
+# Clone repository
+git clone https://github.com/vuvanHuy2409/repo_video.git
+cd repo_video
+
+# Cài đặt thư viện Python
+pip install -r requirements.txt
+
+# Cài đặt trình duyệt Playwright (dùng để tải Douyin/TikTok)
+playwright install chromium
+
+# Tạo file môi trường cấu hình
+cp .env.example .env
+```
+
+### 3. Cấu hình file `.env`
+
+Mở file `.env` và điền các khóa API tương ứng:
+
+```ini
+# --- Azure Speech (ASR + Nhật TTS) ---
+AZURE_SPEECH_KEY=your_azure_speech_key
+AZURE_SPEECH_REGION=japaneast
+
+# --- Vietnamese TTS (LucyLab) ---
+VIETNAMESE_API_KEY=your_lucylab_api_key
+LUCYLAB_API_URL=https://api.lucylab.io/json-rpc
+VIETNAMESE_VOICEID_MALE=2LLtWibYKJaiLFeqVkzPGY
+VIETNAMESE_VOICEID_FEMALE=mhsL3CPLxmLYdSTKp3GANz
+
+# --- AI Translator (OpenAI / Gemini) ---
+OPENAI_API_KEY=your_openai_api_key
+GOOGLE_API_KEY=your_google_api_key
+
+# --- Cấu hình chung ---
+OUTPUT_DIR=./output
+DEFAULT_SOURCE_LANG=zh-CN
+AUDIO_SLOW_FACTOR=0.82
+```
+
+---
+
+## 💻 Sử Dụng Qua Dòng Lệnh (CLI)
+
+Nếu không dùng GUI, bạn có thể chạy các script dòng lệnh trực tiếp:
+
+### 1. Lồng tiếng Việt (`pipeline_vi.py`)
+
+```bash
+# Tải và lồng tiếng từ Douyin / YouTube
 python pipeline_vi.py --url "https://v.douyin.com/..." --source-lang zh --voice male
 
-# File local
-python pipeline_vi.py --file input/video.mp4 --source-lang zh --voice male
+# Xử lý file video local
+python pipeline_vi.py --file input/video.mp4 --source-lang zh --voice female
 
-# Tham số BGM
-python pipeline_vi.py --url ... --bg-mode demucs          # mặc định, chất lượng
-python pipeline_vi.py --url ... --bg-mode duck            # nhanh, giảm -12 dB
-python pipeline_vi.py --url ... --bg-mode duck --bg-duck-db -15
-python pipeline_vi.py --url ... --bg-mode none            # bỏ BGM
+# Tùy chỉnh chế độ nhạc nền (BGM)
+python pipeline_vi.py --url ... --bg-mode demucs     # Tách AI bằng Demucs (Mặc định)
+python pipeline_vi.py --url ... --bg-mode duck       # Giảm âm lượng nhạc gốc
+python pipeline_vi.py --url ... --bg-mode none       # Loại bỏ hoàn toàn nhạc gốc
 ```
 
-### Lồng tiếng Nhật
+### 2. Lồng tiếng Nhật (`pipeline.py`)
 
 ```bash
-python pipeline.py --url ... --source-lang en --voice ja-JP-KeitaNeural
+python pipeline.py --url "https://www.youtube.com/watch?v=..." --source-lang en --voice ja-JP-KeitaNeural
 ```
 
-### Resume sau khi dịch tay
+### 3. Tiếp tục dự án chưa hoàn thành (`--resume`)
 
 ```bash
-python pipeline_vi.py --resume "output/VN/20260601120000_vi" --file input/video.mp4
-python pipeline.py --resume "output/20260601120000" --file input/video.mp4
+python pipeline_vi.py --resume "output/VN/20260726_120000_vi" --file input/video.mp4
 ```
 
-### Batch nhiều video
+### 4. Xử lý hàng loạt (Batch Processing)
 
 ```bash
-python batch_run_vi.py --excel output/video_link.xlsx     # VI từ Excel
-python batch_run_json.py --json list_video.json          # VI từ JSON
-python batch_run.py --excel output/video_link.xlsx       # JP từ Excel
+# Đọc danh sách video từ Excel để lồng Tiếng Việt
+python batch_run_vi.py --excel output/video_link.xlsx
+
+# Đọc từ file JSON
+python batch_run_json.py --json list_video.json
 ```
 
-## Cấu trúc output
+---
+
+## 📂 Cấu Trúc Thư Mục Output
+
+Mỗi dự án sau khi xử lý sẽ tạo ra một thư mục riêng trong `output/`:
 
 ```
-output/VN/20260601120000_vi/
-├── <video_id>.mp4                  # video gốc đã download
-├── original_audio.wav              # audio gốc 16kHz mono
-├── no_vocals.wav                   # BGM tách (chỉ khi --bg-mode demucs)
-├── vocals.wav                      # giọng tách (chỉ khi --bg-mode demucs)
-├── transcript_original.json        # ASR output
-├── transcript_original.srt
-├── TRANSLATE_PENDING.txt           # hướng dẫn dịch (xoá sau khi dịch xong)
-├── transcript_vi.json              # bản dịch (Path A hoặc B tạo)
-├── transcript_vi.srt
-├── segments/seg_xxx.wav            # TTS từng segment
-├── dubbed_audio.wav                # audio cuối (VI + BGM)
-└── dubbed_video.mp4                # video cuối
+output/VN/20260726_120000_vi/
+├── <video_id>.mp4                  # Video gốc đã download
+├── original_audio.wav              # File âm thanh gốc (16kHz mono)
+├── no_vocals.wav                   # Nhạc nền đã tách giọng (Demucs)
+├── vocals.wav                      # Giọng nói gốc đã tách
+├── transcript_original.json        # Phụ đề nhận diện từ Azure ASR
+├── transcript_original.srt         # File srt gốc
+├── transcript_vi.json              # Phụ đề bản dịch Tiếng Việt (hoặc transcript_jp.json)
+├── transcript_vi.srt               # File srt bản dịch
+├── segments/                       # Thư mục chứa audio TTS của từng câu
+│   ├── seg_000.wav
+│   └── seg_001.wav
+├── dubbed_audio.wav                # Âm thanh hoàn chỉnh (Giọng TTS + Nhạc BGM)
+└── dubbed_video.mp4                # Video lồng tiếng thành phẩm cuối cùng
 ```
 
-## Tính năng
+---
 
-- Download Douyin (Playwright), TikTok, YouTube, 1000+ site qua yt-dlp
-- ASR Azure Speech (zh-CN, en, ja, vi, …)
-- 3 chế độ BGM:
-  - `demucs` — tách giọng/nhạc bằng Demucs (htdemucs), chất lượng cao
-  - `duck` — giảm volume audio gốc theo `--bg-duck-db` rồi đè TTS lên
-  - `none` — base silent, không giữ BGM
-- TTS:
-  - **VI** — LucyLab (giọng `male` / `female`)
-  - **JP** — Azure Neural Voice (mặc định `ja-JP-KeitaNeural`)
-- Timeline fit: tự `atempo` (max 1.4x) khi TTS dài hơn segment gốc
-- Resume từ work dir (`--resume`)
-- Batch từ Excel hoặc JSON
-- Sinh SRT (original + dịch)
-- Sinh metadata YouTube (title/description/tags) + thumbnail prompts qua Gemini (nếu có `google_api_key`)
+## 📜 Giấy Phép (License)
 
-## License
-
-MIT.
-# repo_video
+Dự án được phát hành theo giấy phép [MIT License](LICENSE).
