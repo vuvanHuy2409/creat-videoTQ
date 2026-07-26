@@ -175,3 +175,4 @@ output/VN/20260726_120000_vi/
 ## 📜 Giấy Phép (License)
 
 Dự án được phát hành theo giấy phép [MIT License](LICENSE).
+# creat-videoTQ
