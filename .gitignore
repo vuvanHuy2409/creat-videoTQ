@@ -101,7 +101,12 @@ get_content_url.json
 video_links.txt
 scripts/
 
+playwright_profile/
+debug_douyin.jpg
+*.ttf
+
 # ============================================================
 # Legacy local folders
 # ============================================================
 Auto Translade video/
+
