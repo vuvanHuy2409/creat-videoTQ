@@ -1,9 +1,9 @@
-"""Batch Vietnamese Video Dubbing — Read from list_video.json, process sequentially.
+"""Chạy batch lồng tiếng tiếng Việt tuần tự từ danh sách ``list_video.json``.
 
 Usage:
-    python batch_run_json.py                                # Use default list_video.json
-    python batch_run_json.py --json path/to/list.json       # Custom JSON path
-    python batch_run_json.py --skip-video                   # Skip final video merge
+    python batch_run_json.py                                # Dùng list_video.json mặc định
+    python batch_run_json.py --json path/to/list.json       # Chọn file JSON khác
+    python batch_run_json.py --skip-video                   # Bỏ qua bước ghép video cuối
 """
 import argparse
 import json
@@ -21,12 +21,13 @@ DEFAULT_JSON = "list_video.json"
 
 
 def _load_list(path: str) -> list[dict]:
+    """Đọc danh sách video từ JSON UTF-8."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _save_list(data: list[dict], path: str):
-    """Crash-safe save: write to temp file then replace."""
+    """Lưu an toàn: ghi file tạm rồi replace file chính một lần."""
     dir_name = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(suffix=".json", dir=dir_name)
     try:
@@ -40,6 +41,7 @@ def _save_list(data: list[dict], path: str):
 
 
 def main():
+    """Xử lý tuần tự video có trạng thái ``waiting`` trong file JSON."""
     parser = argparse.ArgumentParser(description="Batch Vietnamese Dubbing from JSON list")
     parser.add_argument(
         "--json",
@@ -69,7 +71,7 @@ def main():
 
     videos = _load_list(args.json)
 
-    # Filter waiting videos
+    # Chỉ đưa những video đang chờ vào hàng đợi xử lý.
     pending = [v for v in videos if v.get("status") == "waiting"]
     if not pending:
         logger.info("No pending videos (all status != 'waiting').")
@@ -80,13 +82,14 @@ def main():
 
     success_count = 0
     fail_count = 0
+    pending_count = 0
 
     for i, video in enumerate(pending):
         vid = video["id"]
         url = video["video_url"]
         voice_type = video.get("voice_type", "male")
 
-        # Resolve voice ID from voice_type
+        # Chuyển voice_type trong JSON thành voice ID LucyLab tương ứng.
         if voice_type == "female":
             voice_id = config.VIETNAMESE_VOICEID_FEMALE
         else:
@@ -94,7 +97,7 @@ def main():
 
         logger.info(f"[{i + 1}/{len(pending)}] ID={vid} | {url} | voice={voice_type}")
 
-        # Update status to processing
+        # Ghi trạng thái sớm để lần chạy khác không nhầm là video chưa xử lý.
         video["status"] = "processing"
         _save_list(videos, args.json)
 
@@ -107,6 +110,17 @@ def main():
                 skip_video=args.skip_video,
                 output_dir=args.output_dir,
             )
+
+            if report.get("status") == "translate_pending":
+                video["status"] = "translation_pending"
+                video["output_folder"] = report["work_dir"]
+                video["translation_file"] = report.get("translation_file")
+                pending_count += 1
+                logger.info(
+                    f"[{i + 1}/{len(pending)}] TRANSLATION_PENDING → {report['work_dir']}"
+                )
+                _save_list(videos, args.json)
+                continue
 
             video["status"] = "success"
             video["output_folder"] = report["session_id"]
@@ -126,13 +140,14 @@ def main():
             fail_count += 1
             logger.error(f"[{i + 1}/{len(pending)}] FAILED: {error_msg}")
 
-        # Save after each video
+        # Lưu ngay sau từng video để bảo toàn tiến độ batch.
         _save_list(videos, args.json)
 
     logger.info("=" * 60)
     logger.info("BATCH COMPLETE (Vietnamese from JSON)")
     logger.info(f"  Total:   {len(pending)}")
     logger.info(f"  Success: {success_count}")
+    logger.info(f"  Translation pending: {pending_count}")
     logger.info(f"  Failed:  {fail_count}")
     logger.info(f"  JSON:    {args.json}")
     logger.info("=" * 60)

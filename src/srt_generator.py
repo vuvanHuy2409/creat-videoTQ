@@ -1,11 +1,15 @@
+"""Sinh phụ đề SRT từ danh sách segment có timestamp."""
 from src.utils import format_timestamp, setup_logging
 
 logger = setup_logging("srt_generator")
 
 
 def generate_srt(segments: list[dict], output_path: str, text_field: str = "text") -> str:
+    """Ghi các segment thành SRT, lấy nội dung từ ``text_field``."""
     lines = []
     for i, seg in enumerate(segments, start=1):
+        # Mỗi segment trở thành một block gồm số thứ tự, khoảng thời gian và
+        # nội dung; NFC giúp chữ tiếng Việt/Nhật hiển thị thống nhất.
         start_ts = format_timestamp(seg["start"])
         end_ts = format_timestamp(seg["end"])
         text = seg.get(text_field, seg.get("text", ""))

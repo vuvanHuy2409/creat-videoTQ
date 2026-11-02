@@ -3,12 +3,12 @@
     "id": 1,
     "video_url": "https://www.youtube.com/watch?v=YOUR_VIDEO_ID",
     "voice_type": "male",
-    "status": "pending"
+    "status": "waiting"
   },
   {
     "id": 2,
     "video_url": "https://v.douyin.com/SHORT_LINK/",
     "voice_type": "female",
-    "status": "pending"
+    "status": "waiting"
   }
 ]

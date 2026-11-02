@@ -1,4 +1,4 @@
-"""Run content generation (Step 8) for already-completed videos."""
+"""Chạy riêng bước tạo nội dung YouTube cho các video đã hoàn tất."""
 import json
 import os
 import sys
@@ -14,10 +14,24 @@ logger = setup_logging("content_gen_batch")
 OUTPUT_BASE = os.getenv("OUTPUT_DIR", "./output")
 VN_DIR = os.path.join(OUTPUT_BASE, "VN")
 
+
+def _first_non_empty_env(*names: str, default: str) -> str:
+    """Lấy cấu hình model đầu tiên có giá trị, bỏ qua biến rỗng."""
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
 def main():
+    """Sinh lại thumbnail/metadata còn thiếu cho các video trạng thái success."""
     api_key = os.getenv("google_api_key", "")
-    image_model = os.getenv("image_model_id", "gemini-3-pro-image-preview")
-    content_model = os.getenv("content_model_id", "gemini-3.1-pro-preview")
+    image_model = _first_non_empty_env(
+        "image_model_id", "IMAGE_MODEL_ID", default="gemini-3.1-flash-image"
+    )
+    content_model = _first_non_empty_env(
+        "content_model_id", "CONTENT_MODEL_ID", default="gemini-3.6-flash"
+    )
 
     if not api_key:
         logger.error("google_api_key not set in .env")
@@ -43,9 +57,9 @@ def main():
         has_thumbnails = os.path.exists(os.path.join(folder, "thumbnail_1.png"))
         has_metadata = os.path.exists(os.path.join(folder, "youtube_metadata.json"))
 
-        # Skip if both thumbnails and metadata already exist
+        # Bỏ qua nếu thumbnail và metadata hợp lệ đã có sẵn.
         if has_thumbnails and has_metadata:
-            # Verify metadata is valid (not fallback)
+            # Kiểm tra metadata có phải giá trị fallback hay không.
             try:
                 meta = json.load(open(os.path.join(folder, "youtube_metadata.json"), encoding="utf-8"))
                 if meta.get("title") != "Video":
@@ -62,7 +76,7 @@ def main():
 
         try:
             if has_thumbnails:
-                # Only regenerate metadata
+                # Khi đã có thumbnail, chỉ cần gọi lại model văn bản.
                 script_orig_path = os.path.join(folder, "script_original.txt")
                 script_vi_path = os.path.join(folder, "script_vi.txt")
 
@@ -84,7 +98,7 @@ def main():
                     api_key=api_key,
                     model_id=content_model,
                 )
-                # Save metadata
+                # Lưu JSON và bản TXT tiện copy lên YouTube.
                 meta_path = os.path.join(folder, "youtube_metadata.json")
                 with open(meta_path, "w", encoding="utf-8") as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)

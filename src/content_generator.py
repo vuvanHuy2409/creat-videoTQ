@@ -1,9 +1,7 @@
-"""Content Generator — Thumbnails + YouTube metadata using Google Gemini API.
+"""Tạo thumbnail và metadata YouTube bằng Google Gemini.
 
-Generates:
-- 2 thumbnail images (with text overlay in target language)
-- YouTube metadata (title, description, hashtags)
-- Clean script text files (extracted from transcript JSON)
+Module có thể sinh hai thumbnail, metadata (tiêu đề/mô tả/hashtag) và các file
+script thuần văn bản trích từ transcript JSON.
 """
 import json
 import os
@@ -20,7 +18,7 @@ logger = setup_logging("content_generator")
 
 
 def _extract_video_id(url: str) -> str | None:
-    """Extract YouTube video ID from URL."""
+    """Lấy YouTube video ID từ các dạng URL phổ biến."""
     if not url:
         return None
     patterns = [
@@ -35,7 +33,7 @@ def _extract_video_id(url: str) -> str | None:
 
 
 def fetch_original_thumbnail(url: str, output_dir: str) -> str | None:
-    """Download original video thumbnail from YouTube."""
+    """Tải thumbnail gốc từ YouTube, thử lần lượt maxres và hq."""
     video_id = _extract_video_id(url)
     if not video_id:
         logger.warning("Could not extract video ID from URL, skipping thumbnail fetch")
@@ -63,9 +61,9 @@ def fetch_original_thumbnail(url: str, output_dir: str) -> str | None:
 
 
 def extract_script_text(segments: list[dict], text_field: str, output_path: str) -> str:
-    """Extract plain text from transcript segments and save to .txt file.
+    """Gom text từ các segment thành script thuần và lưu thành file TXT.
 
-    Returns the plain text string.
+    Trả về chuỗi script đã gom.
     """
     lines = []
     for seg in segments:
@@ -90,10 +88,10 @@ def generate_youtube_metadata(
     api_key: str,
     model_id: str,
 ) -> dict:
-    """Generate YouTube title, description, hashtags using Gemini text model.
+    """Dùng Gemini tạo tiêu đề, mô tả và hashtag YouTube.
 
-    Takes plain text scripts (not segments JSON).
-    Returns dict with keys: title, description, hashtags
+    Hàm nhận script thuần thay vì toàn bộ JSON segment và trả về dict gồm
+    ``title``, ``description`` và ``hashtags``.
     """
     if target_lang == "vi-VN":
         lang_name = "Vietnamese"
@@ -108,7 +106,7 @@ def generate_youtube_metadata(
             "Use natural, engaging Japanese suitable for YouTube."
         )
 
-    # Trim scripts to keep prompt small
+    # Cắt ngắn script để prompt không quá lớn và giảm chi phí gọi API.
     orig_trimmed = script_original[:800]
     trans_trimmed = script_translated[:1200]
 
@@ -134,7 +132,7 @@ Respond in this exact JSON format (no markdown code blocks):
 
     client = genai.Client(api_key=api_key)
 
-    # Retry with exponential backoff for 503/transient errors
+    # Lỗi 503/429 tạm thời được thử lại với thời gian chờ tăng dần.
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -171,7 +169,7 @@ Respond in this exact JSON format (no markdown code blocks):
     except json.JSONDecodeError:
         logger.warning(f"JSON parse failed, attempting repair: {text[:100]}...")
         repaired = False
-        # Try progressively more aggressive closing sequences
+        # Thử nối thêm các hậu tố đóng JSON từ nhẹ đến mạnh.
         suffixes = ['"}', ']}', '"]}', '""]}', '" ]}', '"}', '"]  }', '"] }']
         for suffix in suffixes:
             try:
@@ -183,7 +181,7 @@ Respond in this exact JSON format (no markdown code blocks):
                 continue
 
         if not repaired:
-            # Extract fields manually with regex
+            # Nếu vẫn không parse được, lấy các trường cơ bản bằng regex.
             title_match = re.search(r'"title"\s*:\s*"([^"]*)"', text)
             desc_match = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
             tags = re.findall(r'"(#[^"]+)"', text)
@@ -211,12 +209,10 @@ def _build_thumbnail_prompts(
     script_translated: str,
     target_lang: str,
 ) -> list[str]:
-    """Build the 2 thumbnail-generation prompt strings.
+    """Tạo hai prompt sinh thumbnail theo ngôn ngữ đích.
 
-    Pulled out of generate_thumbnails() so callers can save the prompts to
-    disk and feed them into an external image generator (or any tool) without
-    actually paying the Gemini image API. The prompts here are byte-identical
-    to what generate_thumbnails() would have sent to the model.
+    Tách riêng để có thể lưu prompt ra file và dùng công cụ tạo ảnh khác mà
+    không cần gọi Gemini Image API.
     """
     if target_lang == "vi-VN":
         lang_name = "tiếng Việt"
@@ -272,15 +268,14 @@ def generate_thumbnails(
     api_key: str,
     model_id: str,
 ) -> list[str]:
-    """Generate 2 thumbnail images using Gemini image model.
+    """Gọi Gemini Image Model để sinh tối đa hai thumbnail.
 
-    Takes plain text scripts (not segments JSON).
-    Returns list of saved thumbnail file paths.
+    Hàm nhận script thuần và trả danh sách đường dẫn ảnh đã lưu.
     """
     client = genai.Client(api_key=api_key)
     saved_paths = []
 
-    # Load original thumbnail as reference if available
+    # Nếu có thumbnail gốc, dùng nó làm ảnh tham chiếu cho ảnh đầu tiên.
     ref_image_part = None
     if original_thumbnail_path and os.path.exists(original_thumbnail_path):
         with open(original_thumbnail_path, "rb") as f:
@@ -295,7 +290,7 @@ def generate_thumbnails(
         script_original, script_translated, target_lang
     )
 
-    # Resolve language label for the reference-image preface
+    # Nhãn ngôn ngữ được đưa vào phần hướng dẫn ảnh tham chiếu.
     lang_code = "Vietnamese" if target_lang == "vi-VN" else "Japanese"
 
     for i, prompt in enumerate(thumbnail_prompts):
@@ -308,7 +303,7 @@ def generate_thumbnails(
                 contents.append(ref_image_part)
             contents.append(prompt)
 
-            # Retry with backoff for 503 errors
+            # Lỗi dịch vụ tạm thời được retry với backoff tuyến tính.
             response = None
             for attempt in range(5):
                 try:
@@ -358,18 +353,16 @@ def generate_content(
     image_model_id: str,
     content_model_id: str,
 ) -> dict:
-    """Main entry point: generate thumbnails + YouTube metadata.
+    """Điểm vào chính để tạo script, prompt thumbnail và metadata YouTube.
 
-    Steps:
-    1. Extract plain text from transcript JSON → save as .txt files
-    2. Use clean text for API calls (smaller, faster, cheaper)
-    3. Generate thumbnails + metadata
+    Các bước gồm trích text thuần, tạo prompt, gọi model văn bản và ghi kết quả
+    ra thư mục dự án. Phần gọi Image API hiện đang được tắt trong pipeline.
 
     Returns dict with keys: thumbnails, metadata, metadata_file
     """
     result = {"thumbnails": [], "metadata": {}, "metadata_file": None}
 
-    # Determine text field
+    # Chọn trường text theo ngôn ngữ đích.
     if target_lang == "vi-VN":
         text_field = "text_vi"
         script_name = "script_vi.txt"
@@ -377,7 +370,7 @@ def generate_content(
         text_field = "text_jp"
         script_name = "script_jp.txt"
 
-    # Step 1: Extract clean text from segments → .txt files
+    # Bước 1: trích script sạch thành các file TXT.
     script_original = extract_script_text(
         segments, "text",
         os.path.join(output_dir, "script_original.txt"),
@@ -387,15 +380,13 @@ def generate_content(
         os.path.join(output_dir, script_name),
     )
 
-    # Step 2: Fetch original thumbnail
-    # --- DISABLED: only needed when actually generating images via Gemini ---
+    # Bước 2: tải thumbnail gốc (đang tắt vì chỉ cần khi gọi Image API).
     # original_thumb = None
     # if source_url:
     #     original_thumb = fetch_original_thumbnail(source_url, output_dir)
 
-    # Step 3: Build thumbnail prompts and save to file (image API skipped)
-    # To re-enable Gemini image generation, uncomment the generate_thumbnails block
-    # below and the fetch_original_thumbnail block above.
+    # Bước 3: tạo prompt và lưu file; không phát sinh chi phí Image API.
+    # Có thể bật lại generate_thumbnails khi cần sinh ảnh trực tiếp.
     logger.info("Building thumbnail prompts (Gemini image API disabled)")
     thumbnail_prompts = _build_thumbnail_prompts(
         script_original=script_original,
@@ -409,7 +400,7 @@ def generate_content(
     logger.info(f"Thumbnail prompts saved: {prompts_path}")
     result["thumbnail_prompts_file"] = prompts_path
 
-    # --- DISABLED: Gemini image API call ---
+    # --- Đang tắt: lệnh gọi Gemini Image API ---
     # logger.info("Generating thumbnail images...")
     # result["thumbnails"] = generate_thumbnails(
     #     script_original=script_original,
@@ -421,7 +412,7 @@ def generate_content(
     #     model_id=image_model_id,
     # )
 
-    # Step 4: Generate YouTube metadata (using clean text)
+    # Bước 4: tạo metadata bằng script thuần để prompt ngắn hơn.
     logger.info("Generating YouTube metadata (title, description, hashtags)...")
     result["metadata"] = generate_youtube_metadata(
         script_original=script_original,
@@ -432,7 +423,7 @@ def generate_content(
         model_id=content_model_id,
     )
 
-    # Step 5: Save metadata to files
+    # Bước 5: lưu cả JSON máy đọc và TXT tiện copy lên YouTube.
     metadata_path = os.path.join(output_dir, "youtube_metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(result["metadata"], f, ensure_ascii=False, indent=2)

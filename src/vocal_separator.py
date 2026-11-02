@@ -1,14 +1,12 @@
-"""Source-separation step for the dubbing pipeline.
+"""Tách giọng nói khỏi nhạc nền cho pipeline lồng tiếng.
 
-Splits ``original_audio.wav`` into ``vocals.wav`` (the original speaker) and
-``no_vocals.wav`` (everything else: music, SFX, ambient). The pipeline mixes
-``no_vocals.wav`` with the synthesised TTS so dubbed videos retain their
-original soundtrack.
+Tách ``original_audio.wav`` thành ``vocals.wav`` (giọng người nói gốc) và
+``no_vocals.wav`` (nhạc, hiệu ứng, âm thanh môi trường). Pipeline sẽ trộn
+``no_vocals.wav`` với TTS để video lồng tiếng vẫn giữ được soundtrack gốc.
 
-Demucs is invoked through its Python API rather than the ``demucs.separate``
-CLI so the writer never touches ``torchaudio.save`` — that path requires
-``torchcodec`` on torchaudio>=2.10, whose Windows wheels rely on a specific
-FFmpeg ABI we can't guarantee.  Audio is written via ``soundfile`` instead.
+Demucs được gọi qua Python API thay vì CLI ``demucs.separate`` để tránh đường
+ghi ``torchaudio.save`` phụ thuộc ``torchcodec`` và ABI FFmpeg cụ thể. Audio
+được ghi bằng ``soundfile``.
 """
 import os
 import subprocess
@@ -26,16 +24,13 @@ def separate_vocals(
     output_dir: str,
     model: str = DEFAULT_MODEL,
 ) -> dict[str, str | None]:
-    """Run Demucs two-stem separation on ``input_wav``.
+    """Chạy Demucs tách hai nhóm stem từ ``input_wav``.
 
-    Writes ``<output_dir>/vocals.wav`` and ``<output_dir>/no_vocals.wav``,
-    re-encoded to match the sample rate / mono channel layout of
-    ``original_audio.wav`` so they overlay cleanly with the TTS segments.
+    Ghi hai file stem và mã hóa lại về sample rate/mono giống audio gốc để
+    overlay chính xác với các segment TTS.
 
-    Returns ``{"vocals": path, "no_vocals": path}`` on success, or both ``None``
-    on failure (caller falls back to silent-base merge). If both output files
-    already exist the function short-circuits — useful when resuming a
-    partially-run work directory.
+    Trả về đường dẫn khi thành công hoặc cả hai giá trị ``None`` khi thất bại.
+    Nếu hai file đầu ra đã có thì dùng lại để hỗ trợ resume.
     """
     vocals_out = os.path.join(output_dir, "vocals.wav")
     no_vocals_out = os.path.join(output_dir, "no_vocals.wav")
@@ -90,7 +85,7 @@ def separate_vocals(
 
 
 def _run_demucs(input_wav: str, vocals_out: str, no_vocals_out: str, model_name: str) -> None:
-    """Run Demucs via its Python API; write stems with soundfile."""
+    """Chạy Demucs qua Python API và ghi stem bằng soundfile."""
     import numpy as np
     import soundfile as sf
     import torch
@@ -127,7 +122,7 @@ def _run_demucs(input_wav: str, vocals_out: str, no_vocals_out: str, model_name:
 
 
 def _save_wav(path: str, arr, sample_rate: int) -> None:
-    """Write a (channels, samples) float tensor to a 16-bit PCM WAV."""
+    """Ghi tensor float dạng (kênh, mẫu) thành WAV PCM 16-bit."""
     import numpy as np
     import soundfile as sf
 
@@ -136,7 +131,7 @@ def _save_wav(path: str, arr, sample_rate: int) -> None:
 
 
 def _normalize(src: str, dst: str, sample_rate: str) -> None:
-    """Re-encode raw stem to mono PCM at the pipeline's sample rate."""
+    """Mã hóa stem về PCM mono với sample rate của pipeline."""
     cmd = [
         "ffmpeg", "-y", "-i", src,
         "-ac", "1",

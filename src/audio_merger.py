@@ -1,3 +1,4 @@
+"""Đồng bộ và ghép các đoạn TTS vào một track audio hoàn chỉnh."""
 import os
 import shutil
 import subprocess
@@ -16,30 +17,26 @@ def fit_segments_to_timeline(
     max_speedup: float = 1.4,
     tolerance_s: float = 0.1,
 ) -> list[dict]:
-    """Compress segments whose audio overflows into the next segment's start time.
+    """Tăng tốc câu dài trong giới hạn, còn dư cho chồng theo timestamp gốc.
 
-    The merger overlays each segment at its original start timestamp, so if a
-    segment's rendered audio is longer than the gap before the next segment
-    begins, the tail audibly bleeds into the next line. This function applies
-    ffmpeg `atempo` to speed up only the overflowing segments just enough to
-    fit, capped at `max_speedup` to keep voice intelligible. Segments that fit
-    are copied unchanged.
+    Vì bộ ghép đặt audio theo timestamp gốc, phần đuôi của segment quá dài có
+    thể chồng lên câu kế tiếp. Chỉ những segment bị tràn mới được tăng tốc bằng
+    filter ``atempo``; tốc độ bị giới hạn để giọng vẫn dễ nghe.
 
-    The last segment has no successor, so it is never compressed here.
+    Segment cuối dùng end-start làm khoảng trống; không dời câu hay đổi phụ đề.
 
-    Args:
-        segments: ordered list of dicts with id, start, end, duration
-        src_dir: directory containing seg_NNN.wav files
-        dst_dir: directory to write the fitted seg_NNN.wav files
-        max_speedup: max atempo ratio (default 1.4 = +40%)
-        tolerance_s: overflows below this many seconds are ignored
+    Tham số:
+        segments: danh sách segment theo thứ tự, có id/start/end/duration.
+        src_dir: thư mục chứa các file seg_NNN.wav.
+        dst_dir: thư mục ghi các file sau khi đã khớp timeline.
+        max_speedup: tỷ lệ atempo tối đa, mặc định 1.4 (+40%).
+        tolerance_s: phần tràn nhỏ hơn ngưỡng này được bỏ qua.
 
-    Returns:
-        list of adjustment records:
-            {id, available, before, after, speed, status}
-        status is "OK" (no change), "FIT" (compressed and now fits),
-        or "STILL_OVERFLOWS" (capped at max_speedup, will still bleed).
+    Trả về danh sách điều chỉnh với trạng thái ``OK``, ``FIT``,
+    ``STILL_OVERFLOWS`` hoặc ``FFMPEG_ERROR``.
     """
+    from src.video_merger import FFMPEG_BIN
+    from src.tts_speed import tempo_filter
     ensure_dir(dst_dir)
     adjustments: list[dict] = []
 
@@ -53,12 +50,11 @@ def fit_segments_to_timeline(
 
         actual_s = len(AudioSegment.from_wav(src)) / 1000.0
 
+        available_s = max(0.0, float(seg["end"]) - float(seg["start"]))
         if i + 1 < len(segments):
-            available_s = segments[i + 1]["start"] - seg["start"]
-        else:
-            available_s = float("inf")
+            available_s = min(available_s, max(0.0, segments[i + 1]["start"] - seg["start"]))
 
-        if actual_s <= available_s + tolerance_s:
+        if actual_s <= available_s + tolerance_s or available_s <= 0 or max_speedup <= 1.0:
             shutil.copyfile(src, dst)
             adjustments.append({
                 "id": seg["id"],
@@ -66,15 +62,17 @@ def fit_segments_to_timeline(
                 "before": round(actual_s, 2),
                 "after": round(actual_s, 2),
                 "speed": 1.0,
-                "status": "OK",
+                "status": "OK" if actual_s <= available_s + tolerance_s else "STILL_OVERFLOWS",
             })
             continue
 
+        # Tỷ lệ cần thiết để audio mới vừa trong khoảng trống, sau đó áp dụng
+        # giới hạn tốc độ tối đa để tránh giọng đọc bị méo hoặc quá gấp.
         target_ratio = actual_s / available_s
         speed = min(target_ratio, max_speedup)
 
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", src, "-filter:a", f"atempo={speed:.3f}", dst],
+            [FFMPEG_BIN, "-y", "-i", src, "-filter:a", tempo_filter(speed), dst],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -132,12 +130,11 @@ def merge_segments(
     background_path: str | None = None,
     background_gain_db: float = 0.0,
 ) -> str:
-    """Mix per-segment dub audio onto a background track.
+    """Trộn audio TTS từng segment lên nhạc nền hoặc nền im lặng.
 
-    ``background_path`` may point to a clean instrumental (Demucs ``no_vocals``)
-    or to the unmodified ``original_audio.wav``; in the latter case set
-    ``background_gain_db`` to a negative value (e.g. -12.0 ≈ 25% volume) so the
-    original speech sits under the new narration instead of competing with it.
+    ``background_path`` có thể là nhạc đã tách bằng Demucs hoặc audio gốc.
+    Với audio gốc, dùng ``background_gain_db`` âm để tiếng nói cũ nằm nhỏ phía
+    dưới lời thoại mới.
     """
     total_ms = int(total_duration * 1000)
     if background_path:
@@ -145,6 +142,8 @@ def merge_segments(
     else:
         merged = AudioSegment.silent(duration=total_ms)
 
+    # Overlay theo position thay vì nối tiếp, nhờ đó khoảng lặng giữa các câu
+    # vẫn giữ nguyên vị trí của transcript gốc.
     for seg in segments:
         seg_file = os.path.join(segment_dir, f"seg_{seg['id']:03d}.wav")
         if not os.path.exists(seg_file):
@@ -153,6 +152,12 @@ def merge_segments(
 
         segment_audio = AudioSegment.from_wav(seg_file)
         start_ms = int(seg["start"] * 1000)
+        # Overlay permits simultaneous voices, but pydub would otherwise cut
+        # any tail outside the base track. Keep the complete last sentence.
+        required_ms = start_ms + len(segment_audio)
+        if required_ms > len(merged):
+            merged += AudioSegment.silent(duration=required_ms - len(merged),
+                                          frame_rate=merged.frame_rate)
 
         merged = merged.overlay(segment_audio, position=start_ms)
         logger.debug(f"Placed segment {seg['id']} at {seg['start']:.1f}s")
@@ -173,10 +178,10 @@ def merge_segments(
 def _load_background(
     background_path: str, total_ms: int, gain_db: float = 0.0
 ) -> AudioSegment:
-    """Load a background track, apply gain, and pad/truncate it to ``total_ms``.
+    """Đọc nhạc nền, chỉnh gain và đệm/cắt về đúng ``total_ms``.
 
-    Falls back to silent base if the file is missing or unreadable so a
-    pipeline failure in vocal separation never aborts the merge.
+    Nếu file lỗi hoặc không tồn tại, trả về nền im lặng để lỗi tách giọng không
+    làm dừng toàn bộ quá trình ghép video.
     """
     if not os.path.exists(background_path):
         logger.warning(f"Background not found: {background_path}; using silent base")

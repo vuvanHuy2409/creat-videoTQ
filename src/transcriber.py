@@ -1,5 +1,9 @@
+"""Nhận dạng giọng nói liên tục bằng Azure Speech và lưu transcript có mốc thời gian."""
+
 import json
+import os
 import time
+import wave
 import azure.cognitiveservices.speech as speechsdk
 import config
 from src.utils import setup_logging
@@ -8,6 +12,25 @@ logger = setup_logging("transcriber")
 
 
 def transcribe(audio_path: str, language: str) -> list[dict]:
+    """Chạy Azure ASR trên WAV mono PCM và trả danh sách segment theo thời gian."""
+    # SDK của Azure kiểm tra đường dẫn và định dạng chặt hơn FFmpeg. Chuẩn hóa
+    # đường dẫn trước khi tạo AudioConfig để GUI và CLI có hành vi giống nhau.
+    audio_path = os.path.abspath(os.path.expanduser(str(audio_path)))
+    if not os.path.isfile(audio_path):
+        raise FileNotFoundError(f"ASR audio file not found: {audio_path}")
+    if os.path.getsize(audio_path) == 0:
+        raise ValueError(f"ASR audio file is empty: {audio_path}")
+    try:
+        with wave.open(audio_path, "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                raise ValueError(
+                    "ASR audio must be a mono 16-bit PCM WAV "
+                    f"(got channels={wav.getnchannels()}, "
+                    f"sample_width={wav.getsampwidth()}): {audio_path}"
+                )
+    except wave.Error as exc:
+        raise ValueError(f"ASR audio is not a readable PCM WAV: {audio_path}") from exc
+
     speech_config = speechsdk.SpeechConfig(
         subscription=config.AZURE_SPEECH_KEY,
         region=config.AZURE_SPEECH_REGION,
@@ -16,12 +39,20 @@ def transcribe(audio_path: str, language: str) -> list[dict]:
     speech_config.request_word_level_timestamps()
     speech_config.output_format = speechsdk.OutputFormat.Detailed
 
-    audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
-    recognizer = speechsdk.SpeechRecognizer(
-        speech_config=speech_config,
-        audio_config=audio_config,
-    )
+    try:
+        audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config,
+            audio_config=audio_config,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Azure Speech could not open ASR audio file '{audio_path}'. "
+            "Re-run the audio extraction step to regenerate a mono 16-bit WAV."
+        ) from exc
 
+    # Các callback của Speech SDK chạy bất đồng bộ; chúng cùng ghi vào danh sách
+    # segment và dùng cờ ``done`` để vòng lặp chính biết khi nào kết thúc.
     segments = []
     done = False
     segment_id = 0
@@ -80,7 +111,7 @@ def transcribe(audio_path: str, language: str) -> list[dict]:
 
     logger.info(f"Transcription complete: {len(segments)} raw segments")
 
-    # Split long segments into ~MAX_SEGMENT_DURATION chunks
+    # Chia segment dài thành các chunk có thời lượng xấp xỉ MAX_SEGMENT_DURATION.
     segments = split_long_segments(segments, max_duration=10.0)
     logger.info(f"After splitting: {len(segments)} segments")
 
@@ -88,10 +119,10 @@ def transcribe(audio_path: str, language: str) -> list[dict]:
 
 
 def split_long_segments(segments: list[dict], max_duration: float = 10.0) -> list[dict]:
-    """Split segments longer than max_duration into smaller ones at sentence boundaries.
+    """Chia segment dài thành đoạn ngắn hơn tại ranh giới câu.
 
-    Uses punctuation (. ! ? ;) to find split points. Distributes time
-    proportionally based on character count.
+    Dấu câu được dùng làm điểm tách; thời lượng được phân bổ theo số ký tự để
+    giữ tương đối nhịp nói gốc.
     """
     import re
     result = []
@@ -103,15 +134,15 @@ def split_long_segments(segments: list[dict], max_duration: float = 10.0) -> lis
             result.append({**seg, "id": new_id})
             continue
 
-        # Split text at sentence boundaries
+        # Ưu tiên tách ở dấu câu thay vì cắt giữa một từ/câu hoàn chỉnh.
         sentences = re.split(r'(?<=[.!?;])\s+', seg["text"].strip())
         if len(sentences) <= 1:
-            # No sentence boundary found, keep as-is
+            # Không tìm thấy ranh giới câu thì giữ nguyên đoạn hiện tại.
             new_id += 1
             result.append({**seg, "id": new_id})
             continue
 
-        # Group sentences into chunks that fit within max_duration
+        # Gom các câu liên tiếp sao cho mỗi nhóm gần với giới hạn thời lượng.
         total_chars = sum(len(s) for s in sentences)
         total_duration = seg["duration"]
         start = seg["start"]
@@ -122,7 +153,8 @@ def split_long_segments(segments: list[dict], max_duration: float = 10.0) -> lis
         for sentence in sentences:
             estimated_chunk_duration = (chunk_chars + len(sentence)) / total_chars * total_duration
 
-            # If adding this sentence exceeds max_duration and we already have content, flush
+            # Nếu thêm câu mới làm vượt giới hạn và nhóm hiện tại đã có nội dung,
+            # chốt nhóm cũ trước khi bắt đầu nhóm tiếp theo.
             if chunk_sentences and estimated_chunk_duration > max_duration:
                 chunk_duration = chunk_chars / total_chars * total_duration
                 end = round(start + chunk_duration, 3)
@@ -141,7 +173,7 @@ def split_long_segments(segments: list[dict], max_duration: float = 10.0) -> lis
             chunk_sentences.append(sentence)
             chunk_chars += len(sentence)
 
-        # Flush remaining
+        # Ghi nhóm câu còn lại và dùng đúng thời điểm kết thúc của segment gốc.
         if chunk_sentences:
             end = seg["end"]
             new_id += 1
@@ -157,6 +189,7 @@ def split_long_segments(segments: list[dict], max_duration: float = 10.0) -> lis
 
 
 def save_transcript(segments: list[dict], output_path: str) -> str:
+    """Lưu transcript JSON UTF-8, giữ nguyên chữ Unicode và format dễ đọc."""
     import os
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:

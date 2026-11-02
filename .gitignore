@@ -5,6 +5,10 @@
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
+data/studio.sqlite3*
+data/backups/
 *.key
 *.pem
 *_cookies.txt
@@ -99,14 +103,25 @@ input/
 list_video.json
 get_content_url.json
 video_links.txt
-scripts/
 
 playwright_profile/
 debug_douyin.jpg
 *.ttf
+!assets/fonts/ttf/*.ttf
 
 # ============================================================
 # Legacy local folders
 # ============================================================
 Auto Translade video/
+
+# Archived experiments and generated training artifacts
+models/
+dataset/
+datasets/
+runs/
+*.pt
+*.onnx
+TRANSLATE_PENDING.txt
+debug_*.jpg
+debug_*.png
 

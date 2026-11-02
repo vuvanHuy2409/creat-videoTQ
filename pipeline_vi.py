@@ -1,32 +1,44 @@
-"""Vietnamese Video Dubbing Pipeline — CLI Entry Point.
+"""Điểm vào CLI cho pipeline lồng tiếng tiếng Việt.
 
-Usage:
-    python pipeline_vi.py                          # Reads VIDEO_URL from .env
-    python pipeline_vi.py --url "https://..."      # Override with CLI arg
+Ví dụ:
+    python pipeline_vi.py                          # đọc URL từ .env
+    python pipeline_vi.py --url "https://..."      # ghi đè URL bằng CLI
     python pipeline_vi.py --file video.mp4 --source-lang en
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-import shutil
 from datetime import datetime
 
 import config
+from src.pipeline_history import track_pipeline, bind_project
+from src.voice_registry import pipeline_voice
+from src.subtitle_fonts import font_names, get_font, validate_size
+from src.subtitle_style import (SubtitleStyle, add_style_arguments, style_overrides_from_args,
+                                load_project_subtitles, save_project_subtitles)
 from src.utils import setup_logging, ensure_dir
 from src.downloader import download_video
 from src.audio_extractor import extract_audio
 from src.transcriber import transcribe, save_transcript
-from src.synthesizer_vi import synthesize_segment_vi
+from src.synthesizer_vi import synthesize_segment_vi, is_usable_tts_audio
 from src.audio_merger import merge_segments, fit_segments_to_timeline
 from src.vocal_separator import separate_vocals
 from src.video_merger import merge_video
-from src.translate_pending import write_hint as _write_translate_pending_hint
+from src.translate_pending import (
+    has_complete_translation,
+    write_hint as _write_translate_pending_hint,
+)
 from src.srt_generator import generate_srt
+from src.subtitle_timing import generate_tts_subtitles, apply_fitted_timing_to_results
 from src.content_generator import generate_content
-from src.ai_subtitle_blur import apply_ai_blur
+from src.ai_subtitle_blur import AI_BLUR_MODE, apply_ai_blur
+from src.ocr_image_replace import OCR_IMAGE_REPLACE_MODE, apply_ocr_image_replace
+from src.video_quality import has_current_quality_marker
 
 logger = setup_logging("pipeline_vi")
 
@@ -42,8 +54,53 @@ LANG_MAP = {
 }
 
 
+def _secret_fingerprint(value: str | None) -> str:
+    """Tạo dấu vân tay ngắn, không thể đảo ngược, để invalid cache TTS."""
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_tts_cache_config(voice_id: str | None, segments: list[dict] | None = None) -> dict:
+    """Mô tả các thiết lập quyết định nội dung audio TTS đã sinh."""
+    api_keys = tuple(getattr(config, "VIETNAMESE_API_KEYS", ()) or ())
+    if not api_keys and config.VIETNAMESE_API_KEY:
+        api_keys = (config.VIETNAMESE_API_KEY,)
+    key_fingerprints = [_secret_fingerprint(value) for value in api_keys]
+    has_lucylab = bool(api_keys) and not (voice_id or "").startswith("azure:")
+    return {
+        "provider": "lucylab" if has_lucylab else "azure",
+        "voice_id": voice_id or "",
+        "lucylab_api_url": config.LUCYLAB_API_URL if has_lucylab else "",
+        # Giữ field cũ để tương thích nhưng theo dõi mọi key dự phòng; khi key
+        # thay đổi, audio TTS cũ sẽ không được dùng lại.
+        "api_key_fingerprint": key_fingerprints[0] if key_fingerprints else "",
+        "api_key_fingerprints": key_fingerprints,
+        "api_key_count": len(api_keys),
+        "azure_vi_tts_voice": getattr(config, "AZURE_VI_TTS_VOICE", ""),
+        "azure_region": config.AZURE_SPEECH_REGION,
+        "tempo_version": 2,
+        "tts_speed": config.TTS_SPEED,
+        "azure_key_fingerprint": _secret_fingerprint(config.AZURE_SPEECH_KEY),
+        "text_fingerprint": _secret_fingerprint(json.dumps(
+            [(segment["id"], segment.get("text_vi", segment.get("text", ""))) for segment in (segments or [])],
+            ensure_ascii=False,
+        )),
+    }
+
+
+def _load_tts_cache_config(path: str) -> dict | None:
+    """Đọc manifest cache TTS, lỗi hoặc JSON sai thì trả về ``None``."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[dict]) -> dict:
-    """Build a timing guide JSON for Vietnamese audio."""
+    """Tạo timing guide JSON cho audio tiếng Việt."""
     guide = {
         "session_id": report["session_id"],
         "source_url": report["source_url"],
@@ -79,6 +136,7 @@ def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[di
             "text_vi": seg.get("text_vi", ""),
             "start": seg["start"],
             "end": seg["end"],
+            **{key: tts[key] for key in ("audio_start", "audio_end", "subtitle_start", "subtitle_end") if key in tts},
             "original_duration": seg["duration"],
             "vi_duration": tts["actual_duration"],
             "diff_seconds": diff,
@@ -96,14 +154,14 @@ def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[di
 
 
 def _get_default_vi_output_dir() -> str:
-    """Get Vietnamese output directory: VIETNAMESE_OUTPUT_DIR or OUTPUT_DIR/VN."""
+    """Lấy thư mục output Việt từ cấu hình hoặc dùng ``OUTPUT_DIR/VN``."""
     if config.VIETNAMESE_OUTPUT_DIR:
         return config.VIETNAMESE_OUTPUT_DIR
     return os.path.join(config.OUTPUT_DIR, "VN")
 
 
 def _ask_voice_gender() -> str:
-    """Ask user to choose male or female voice. Returns voice ID."""
+    """Hỏi người dùng chọn giọng nam/nữ và trả về voice ID tương ứng."""
     print("\n" + "=" * 40)
     print("Chọn giọng đọc / Choose voice:")
     print("  1. Nam (Male)")
@@ -125,6 +183,7 @@ def _ask_voice_gender() -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    """Đọc tùy chọn CLI, nguồn video và voice ID cho pipeline tiếng Việt."""
     parser = argparse.ArgumentParser(description="Vietnamese Video Dubbing Pipeline: EN/JA → VI")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--url", help="YouTube/TikTok video URL (default: VIDEO_URL from .env)")
@@ -137,9 +196,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--voice",
-        choices=["male", "female"],
         default=None,
-        help="Voice gender: male or female (if not set, will ask interactively)",
+        help="male/female, an Azure reference, or a saved SQLite voice reference",
     )
     parser.add_argument(
         "--skip-video",
@@ -159,7 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=_get_default_vi_output_dir(),
-        help=f"Output directory (default: ANKO Project/VN)",
+        help="Output directory (default: VIETNAMESE_OUTPUT_DIR or OUTPUT_DIR/VN)",
     )
     parser.add_argument(
         "--subtitle-y",
@@ -169,9 +227,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--subtitle-size",
-        type=int,
-        default=38,
-        help="Font size of subtitles in pixels (default: 38)",
+        type=validate_size,
+        default=None,
+        help="Subtitle size in pixels (12-160; default: SUBTITLE_FONT_SIZE)",
+    )
+    add_style_arguments(parser)
+    parser.add_argument(
+        "--subtitle-font",
+        choices=font_names(),
+        default=None,
+        help="Bundled subtitle font family (default: SUBTITLE_FONT)",
     )
     parser.add_argument(
         "--resume",
@@ -182,7 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ai-blur",
         action="store_true",
-        help="Use AI (YOLO/EasyOCR) to automatically detect and blur Chinese subtitles.",
+        help="Use EasyOCR to automatically detect and blur Chinese subtitles.",
     )
     parser.add_argument(
         "--bg-mode",
@@ -222,17 +287,9 @@ def parse_args() -> argparse.Namespace:
         else:
             parser.error("No video specified. Use --url, --file, --resume, or set VIETNAMESE_VIDEO_URL in .env")
 
-    # Resolve voice ID: CLI flag > .env Voice_type > interactive prompt
-    if args.voice == "male":
-        args.voice_id = config.VIETNAMESE_VOICEID_MALE
-    elif args.voice == "female":
-        args.voice_id = config.VIETNAMESE_VOICEID_FEMALE
-    elif config.VOICE_TYPE == "male":
-        args.voice_id = config.VIETNAMESE_VOICEID_MALE
-        logger.info("Using VOICE_TYPE=male from .env")
-    elif config.VOICE_TYPE == "female":
-        args.voice_id = config.VIETNAMESE_VOICEID_FEMALE
-        logger.info("Using VOICE_TYPE=female from .env")
+    reference = args.voice or config.DEFAULT_VOICE_VI or config.VOICE_TYPE
+    if reference:
+        args.voice_id = pipeline_voice("vi", reference, vars(config))
     else:
         args.voice_id = _ask_voice_gender()
 
@@ -240,15 +297,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_video(work_dir: str, url: str | None, file_path: str | None) -> str:
-    """Locate the source video for this work_dir.
+    """Tìm video nguồn, ưu tiên file chỉ định hoặc artifact đã có khi resume.
 
-    Resume-friendly: if a prior run already downloaded/copied the source video
-    into work_dir, reuse it instead of re-downloading. Skips any files whose
-    name matches a pipeline output (dubbed_video*.mp4) so we don't mistake the
-    rendered result for the source.
-
-    If --file is passed, that takes precedence — useful when the user keeps
-    the source outside work_dir.
+    Các file có tên ``dubbed_video*.mp4`` bị bỏ qua vì đó là kết quả render.
+    ``--file`` được ưu tiên để hỗ trợ nguồn nằm ngoài thư mục dự án.
     """
     if file_path:
         if not os.path.exists(file_path):
@@ -276,8 +328,33 @@ def _resolve_video(work_dir: str, url: str | None, file_path: str | None) -> str
     )
 
 
+def _subtitle_y_pixel(video_path: str, value: float) -> float:
+    """Đổi ``--subtitle-y`` dạng phần trăm sang pixel, giữ tương thích GUI.
+
+    CLI hiển thị tùy chọn này là phần trăm (mặc định 72), còn giao diện cũ đã
+    truyền pixel như 780. Giá trị <=100 được hiểu là phần trăm; giá trị lớn
+    hơn 100 được giữ nguyên như pixel.
+    """
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 72.0
+    if 0 < numeric <= 100:
+        try:
+            import cv2
+
+            cap = cv2.VideoCapture(video_path)
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            if frame_h > 0:
+                return frame_h * numeric / 100.0
+        except Exception:
+            pass
+    return numeric
+
+
 def _detect_source_lang(text: str, default_lang: str) -> str:
-    """Detect if text is Chinese, Japanese, Korean, or default."""
+    """Đoán tiếng Trung/Nhật/Hàn bằng Unicode, nếu không dùng mặc định."""
     if any('\u4e00' <= c <= '\u9fff' for c in text):
         return "zh"
     if any('\u3040' <= c <= '\u30ff' for c in text):
@@ -287,6 +364,7 @@ def _detect_source_lang(text: str, default_lang: str) -> str:
     return default_lang
 
 
+@track_pipeline("vi")
 def run_pipeline_vi(
     url: str | None,
     file_path: str | None,
@@ -300,15 +378,20 @@ def run_pipeline_vi(
     burn_subtitles: bool = False,
     ocr_replace: bool = False,
     subtitle_y: float = 72.0,
-    subtitle_size: int = 40,
+    subtitle_size: int | None = None,
     ai_blur: bool = False,
+    subtitle_font: str | None = None,
+    subtitle_style: dict | SubtitleStyle | None = None,
 ) -> dict:
+    """Chạy pipeline tải, ASR, dịch thủ công, TTS và render sang tiếng Việt."""
     start_time = time.time()
+    if voice_id.startswith("voice:"):
+        voice_id = pipeline_voice("vi", voice_id, vars(config))
 
     lang_code = LANG_MAP.get(source_lang, source_lang)
     logger.info(f"Source language: {lang_code} → Vietnamese")
 
-    # Resume an existing work_dir or create a new timestamped one
+    # Resume dùng lại thư mục cũ; lần chạy mới tạo thư mục timestamp hậu tố _vi.
     if resume_dir:
         if not os.path.isdir(resume_dir):
             raise FileNotFoundError(f"Resume directory not found: {resume_dir}")
@@ -320,18 +403,32 @@ def run_pipeline_vi(
         work_dir = os.path.abspath(ensure_dir(os.path.join(output_dir, folder_name)))
         logger.info(f"Output folder: {work_dir}")
 
+    profile = load_project_subtitles(work_dir)
+    if subtitle_font is not None:
+        profile["SUBTITLE_FONT"] = subtitle_font
+    if subtitle_size is not None:
+        profile["SUBTITLE_FONT_SIZE"] = str(subtitle_size)
+    if subtitle_style is not None:
+        profile.update(subtitle_style.to_settings() if isinstance(subtitle_style, SubtitleStyle) else subtitle_style)
+    profile = save_project_subtitles(work_dir, profile)
+    subtitle_font = profile["SUBTITLE_FONT"]
+    subtitle_size = int(profile["SUBTITLE_FONT_SIZE"])
+    subtitle_style = SubtitleStyle.from_settings(profile)
+
+    bind_project(work_dir, "vi")
+
     transcript_orig_path = os.path.join(work_dir, "transcript_original.json")
     transcript_vi_path = os.path.join(work_dir, "transcript_vi.json")
     audio_path = os.path.join(work_dir, "original_audio.wav")
 
-    # --- Step 1: Download or use local file ---
+    # ── Bước 1: tải video hoặc dùng file cục bộ ─────────────────────────────
     logger.info("=" * 60)
     logger.info("STEP 1: Acquiring video")
     video_path = _resolve_video(work_dir, url, file_path)
     logger.info(f"Video: {video_path}")
 
 
-    # --- Step 2: Extract audio ---
+    # ── Bước 2: trích audio đầu vào ─────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("STEP 2: Extracting audio")
     if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
@@ -339,7 +436,8 @@ def run_pipeline_vi(
     else:
         logger.info(f"Reusing existing audio: {audio_path}")
 
-    # --- Step 2.5: Resolve background track for the dub merge ---
+    # ── Bước 2.5: chọn background theo demucs/duck/none ────────────────────
+    # Demucs giữ nhạc/hiệu ứng; duck giảm toàn bộ audio gốc; none dùng nền im lặng.
     background_path: str | None = None
     background_gain_db: float = 0.0
     if bg_mode == "demucs":
@@ -362,7 +460,7 @@ def run_pipeline_vi(
     elif bg_mode == "none":
         logger.info("STEP 2.5 skipped: --bg-mode=none, dubbed audio uses silent base")
 
-    # --- Step 3: Speech-to-Text (ASR) ---
+    # ── Bước 3: nhận dạng lời nói và cache transcript ──────────────────────
     logger.info("=" * 60)
     logger.info("STEP 3: Transcribing audio (ASR)")
     if os.path.exists(transcript_orig_path):
@@ -378,43 +476,82 @@ def run_pipeline_vi(
         generate_srt(segments, os.path.join(work_dir, "transcript_original.srt"), text_field="text")
         logger.info(f"Transcribed {len(segments)} segments")
 
-    # --- Step 4: Translate to Vietnamese ---
+    # ── Bước 4: điểm dừng dịch tiếng Việt thủ công ─────────────────────────
     logger.info("=" * 60)
-    logger.info("STEP 4: Translating to Vietnamese")
+    logger.info("STEP 4: Loading manual Vietnamese translation")
     is_valid_translation = False
     if os.path.exists(transcript_vi_path):
-        with open(transcript_vi_path, encoding="utf-8") as f:
-            cached_segments = json.load(f)
-            if cached_segments and any("text_vi" in seg for seg in cached_segments):
+        try:
+            with open(transcript_vi_path, encoding="utf-8") as f:
+                cached_segments = json.load(f)
+            if has_complete_translation(cached_segments, "text_vi", segments):
                 segments = cached_segments
                 is_valid_translation = True
+            else:
+                logger.warning(
+                    "transcript_vi.json exists but is incomplete; manual translation is still required."
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(f"Cannot load manual translation file: {exc}")
 
     if is_valid_translation:
         logger.info(f"Reusing existing translation: {transcript_vi_path}")
-        generate_srt(segments, os.path.join(work_dir, "transcript_vi.srt"), text_field="text_vi")
+        pending_hint = os.path.join(work_dir, "TRANSLATE_PENDING.txt")
+        if os.path.exists(pending_hint):
+            os.remove(pending_hint)
     else:
-        from src.translator import translate_segments_vi
-        try:
-            logger.info(f"Automatically translating {len(segments)} segments to Vietnamese...")
-            segments = translate_segments_vi(segments, source_lang)
-            save_transcript(segments, transcript_vi_path)
-            generate_srt(segments, os.path.join(work_dir, "transcript_vi.srt"), text_field="text_vi")
-            logger.info("Automatic translation completed and saved to transcript_vi.json")
-        except Exception as e:
-            logger.error(f"Automatic translation failed: {e}")
-            shutil.copy2(transcript_orig_path, transcript_vi_path)
-            _write_translate_pending_hint(work_dir, "vi-VN", source_lang)
-            return {"status": "translate_pending", "work_dir": work_dir}
+        hint_path = _write_translate_pending_hint(work_dir, "vi-VN", source_lang)
+        logger.warning(
+            "Manual translation required — no translation API was called. "
+            f"Edit transcript_vi.json from the desktop app or follow {hint_path}, then resume."
+        )
+        return {
+            "status": "translate_pending",
+            "session_id": folder_name,
+            "work_dir": work_dir,
+            "translation_file": transcript_vi_path,
+            "translation_hint": hint_path,
+        }
 
-    # --- Step 4B: AI Subtitle Blur (chạy sau khi dịch xong, trước TTS) ---
+    # ── Bước 4B: xoá phụ đề cứng sau dịch, trước khi TTS ───────────────────
     logger.info("=" * 60)
-    if ai_blur:
+    # OCR replace là chế độ chính: OCR tìm box chữ Trung, OpenCV xử lý ảnh
+    # cục bộ đúng vùng đó rồi bước 7 đặt phụ đề Việt lên đúng vị trí. Chạy
+    # trước TTS để log lỗi rõ ràng và để artifact có thể dùng lại khi resume.
+    if ocr_replace:
+        logger.info("STEP 4B: Removing Chinese subtitles with OCR + local image cleanup")
+        cleaned_video_path = os.path.join(work_dir, "video_ocr_cleaned.mp4")
+        if (
+            os.path.exists(cleaned_video_path)
+            and os.path.getsize(cleaned_video_path) > 0
+            and has_current_quality_marker(cleaned_video_path, OCR_IMAGE_REPLACE_MODE)
+        ):
+            logger.info(f"Reusing OCR-cleaned video: {cleaned_video_path}")
+            video_path = cleaned_video_path
+        else:
+            if os.path.exists(cleaned_video_path):
+                logger.info("Existing OCR-cleaned video is from an older algorithm; regenerating it.")
+            success = apply_ocr_image_replace(video_path, cleaned_video_path)
+            if not success:
+                raise RuntimeError(
+                    "OCR không tìm thấy chữ Trung trong vùng 20%-40% tính từ đáy "
+                    "hoặc không thể phục hồi ảnh. Không tạo video để tránh giữ lại phụ đề gốc."
+                )
+            video_path = cleaned_video_path
+            logger.info("OCR image subtitle replacement completed successfully.")
+    elif ai_blur:
         logger.info("STEP 4B: Applying AI Subtitle Blur")
         blurred_video_path = os.path.join(work_dir, "video_ai_blurred.mp4")
-        if os.path.exists(blurred_video_path) and os.path.getsize(blurred_video_path) > 0:
+        if (
+            os.path.exists(blurred_video_path)
+            and os.path.getsize(blurred_video_path) > 0
+            and has_current_quality_marker(blurred_video_path, AI_BLUR_MODE)
+        ):
             logger.info(f"Reusing existing AI blurred video: {blurred_video_path}")
             video_path = blurred_video_path
         else:
+            if os.path.exists(blurred_video_path):
+                logger.info("Existing AI-blurred video was created with an older quality profile; regenerating it.")
             success = apply_ai_blur(video_path, blurred_video_path, ocr_every_n_frames=2)
             if success:
                 video_path = blurred_video_path
@@ -422,10 +559,27 @@ def run_pipeline_vi(
             else:
                 logger.error("AI blur failed, continuing with original video.")
 
-    # --- Step 5: TTS for each segment (LucyLab API) ---
+    # ── Bước 5: TTS từng segment, có cache và Azure fallback ───────────────
     logger.info("=" * 60)
     logger.info("STEP 5: Synthesizing Vietnamese audio (LucyLab TTS)")
     seg_dir = ensure_dir(os.path.join(work_dir, "segments"))
+    tts_config_path = os.path.join(work_dir, "tts_config.json")
+    current_tts_config = _build_tts_cache_config(voice_id, segments)
+    previous_tts_config = _load_tts_cache_config(tts_config_path)
+    tts_cache_matches = previous_tts_config == current_tts_config
+    if tts_cache_matches:
+        logger.info(
+            "TTS cache matches current provider/API/voice settings; reusable audio will be kept."
+        )
+    else:
+        logger.info(
+            "TTS provider/API/voice settings changed (or no cache manifest exists); "
+            "regenerating every spoken segment."
+        )
+    logger.info(
+        f"Using TTS provider={'LucyLab' if current_tts_config['provider'] == 'lucylab' else 'Azure fallback'}, "
+        f"voice_id={voice_id}"
+    )
     tts_results = []
     from pydub import AudioSegment as _ASeg
 
@@ -435,7 +589,9 @@ def run_pipeline_vi(
         
 
 
-        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+        has_spoken_text = bool(re.search(r"\w", text_to_speak))
+        cached_is_usable = is_usable_tts_audio(seg_path)
+        if tts_cache_matches and os.path.exists(seg_path) and os.path.getsize(seg_path) > 0 and (cached_is_usable or not has_spoken_text):
             cached = _ASeg.from_wav(seg_path)
             result = {
                 "path": seg_path,
@@ -448,6 +604,14 @@ def run_pipeline_vi(
                 f"target {seg['duration']:.1f}s)"
             )
         else:
+            if tts_cache_matches and os.path.exists(seg_path):
+                logger.warning(
+                    f"  Segment {seg['id']}: cached audio is silent or invalid; regenerating TTS."
+                )
+            elif os.path.exists(seg_path):
+                logger.info(
+                    f"  Segment {seg['id']}: regenerating because TTS settings changed."
+                )
             result = synthesize_segment_vi(
                 text_vi=text_to_speak,
                 output_path=seg_path,
@@ -460,34 +624,31 @@ def run_pipeline_vi(
             )
         tts_results.append(result)
 
-    # --- Step 6: Slow down + Fit-to-timeline + Merge audio ---
+    # Chỉ ghi manifest sau khi mọi segment thành công; nếu giữa chừng lỗi thì
+    # lần resume sau phải thử lại thay vì tin cache sinh dở.
+    with open(tts_config_path, "w", encoding="utf-8") as f:
+        json.dump(current_tts_config, f, ensure_ascii=False, indent=2)
+    logger.info(f"TTS cache manifest saved: {tts_config_path}")
+
+    # ── Bước 6: tăng tốc có giới hạn, rồi ghép đúng timestamp gốc ────────
     logger.info("=" * 60)
-    slow_factor = config.AUDIO_SLOW_FACTOR
     total_duration = max(seg["end"] for seg in segments) + 1.0 if segments else 0
-
-    if slow_factor < 1.0:
-        slow_pct = round((1.0 - slow_factor) * 100)
-        logger.info(f"STEP 6a: Slowing segments {slow_pct}% (atempo={slow_factor})")
-        slow_dir = ensure_dir(os.path.join(work_dir, f"segments_slow{slow_pct}"))
-        for seg in segments:
-            src = os.path.join(seg_dir, f"seg_{seg['id']:03d}.wav")
-            dst = os.path.join(slow_dir, f"seg_{seg['id']:03d}.wav")
-            if os.path.exists(src):
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", src, "-filter:a", f"atempo={slow_factor}", dst],
-                    capture_output=True, text=True,
-                )
-        pre_fit_dir = slow_dir
-    else:
-        pre_fit_dir = seg_dir
-
-    logger.info("STEP 6b: Fitting segments to timeline (avoid overlap)")
+    max_extra = max(1.0, config.TTS_OVERFLOW_MAX_SPEED / config.TTS_SPEED)
+    logger.info("STEP 6: base speed %.2fx; catch-up ceiling %.2fx; remaining overflow may overlap",
+                config.TTS_SPEED, max(config.TTS_SPEED, config.TTS_OVERFLOW_MAX_SPEED))
     fit_dir = ensure_dir(os.path.join(work_dir, "segments_fit"))
-    fit_adjustments = fit_segments_to_timeline(segments, pre_fit_dir, fit_dir)
+    fit_adjustments = fit_segments_to_timeline(segments, seg_dir, fit_dir, max_speedup=max_extra)
+    for adjustment in fit_adjustments:
+        adjustment["effective_speed"] = round(config.TTS_SPEED * adjustment["speed"], 3)
 
     fit_log_path = os.path.join(work_dir, "fit_adjustments.json")
     with open(fit_log_path, "w", encoding="utf-8") as f:
         json.dump(fit_adjustments, f, ensure_ascii=False, indent=2)
+
+    subtitle_segments = generate_tts_subtitles(
+        segments, fit_dir, os.path.join(work_dir, "transcript_vi.srt"), "text_vi")
+    apply_fitted_timing_to_results(tts_results, subtitle_segments, fit_adjustments)
+    logger.info("Subtitle timing follows fitted Vietnamese speech; silent WAV padding is excluded.")
 
     logger.info("STEP 6c: Merging audio segments")
     merged_audio_path = os.path.join(work_dir, "audio_vi_full.wav")
@@ -497,7 +658,7 @@ def run_pipeline_vi(
         background_gain_db=0.5,
     )
 
-    # --- Step 7: Merge audio & video ---
+    # ── Bước 7: ghép audio, video và tùy chọn phụ đề ───────────────────────
     if skip_video:
         logger.info("Skipping video merge (--skip-video)")
         dubbed_video_path = None
@@ -505,7 +666,7 @@ def run_pipeline_vi(
         logger.info("=" * 60)
         logger.info("STEP 7: Merging audio, video, and subtitle")
         
-        # Đọc toạ độ Y tự động do AI Subtitle Blur phân tích (nếu có)
+        # Nếu blur đã phân tích vùng chữ, ưu tiên tọa độ Y tự động cho subtitle.
         y_pos_file = os.path.join(work_dir, "subtitle_y_pos.txt")
         if os.path.exists(y_pos_file):
             try:
@@ -518,15 +679,19 @@ def run_pipeline_vi(
 
         dubbed_video_path = os.path.join(work_dir, "dubbed_video.mp4")
         srt_vi = os.path.join(work_dir, "transcript_vi.srt")
+        subtitle_y_px = _subtitle_y_pixel(video_path, subtitle_y)
         if ocr_replace:
-            from src.video_merger import merge_video_with_ocr_replace
-            merge_video_with_ocr_replace(
+            # Ảnh đã được làm sạch ở bước 4B; ở đây chỉ burn SRT Việt, không
+            # vẽ thêm hộp trắng che toàn khung.
+            merge_video(
                 video_path=video_path,
                 audio_path=merged_audio_path,
                 output_path=dubbed_video_path,
                 srt_path=srt_vi,
-                y_pixel=subtitle_y,
+                y_pixel=subtitle_y_px,
                 font_size=subtitle_size,
+                font_name=subtitle_font,
+                subtitle_style=subtitle_style,
             )
         elif burn_subtitles:
             merge_video(
@@ -534,19 +699,23 @@ def run_pipeline_vi(
                 audio_path=merged_audio_path,
                 output_path=dubbed_video_path,
                 srt_path=srt_vi,
-                y_pixel=subtitle_y,
+                y_pixel=subtitle_y_px,
                 font_size=subtitle_size,
+                font_name=subtitle_font,
+                subtitle_style=subtitle_style,
             )
         else:
             merge_video(
                 video_path=video_path,
                 audio_path=merged_audio_path,
                 output_path=dubbed_video_path,
-                y_pixel=subtitle_y,
+                y_pixel=subtitle_y_px,
                 font_size=subtitle_size,
+                font_name=subtitle_font,
+                subtitle_style=subtitle_style,
             )
 
-    # --- Step 8: Generate thumbnails + YouTube metadata ---
+    # ── Bước 8: tạo prompt thumbnail và metadata nếu có Gemini key ─────────
     content_result = {"thumbnails": [], "metadata": {}}
     if config.GOOGLE_API_KEY:
         logger.info("=" * 60)
@@ -568,7 +737,7 @@ def run_pipeline_vi(
     else:
         logger.info("Skipping thumbnail/metadata generation (GOOGLE_API_KEY not set)")
 
-    # --- Generate report ---
+    # Ghi report tổng hợp để GUI/batch theo dõi tiến độ và artifact.
     elapsed = time.time() - start_time
     report = {
         "session_id": folder_name,
@@ -588,6 +757,7 @@ def run_pipeline_vi(
             "transcript_original_srt": os.path.join(work_dir, "transcript_original.srt"),
             "transcript_vi_json": os.path.join(work_dir, "transcript_vi.json"),
             "transcript_vi_srt": os.path.join(work_dir, "transcript_vi.srt"),
+            "subtitle_timing": os.path.join(work_dir, "subtitle_timing.json"),
             "audio_vi_full": merged_audio_path,
             "dubbed_video": dubbed_video_path,
             "thumbnails": content_result.get("thumbnails", []),
@@ -599,7 +769,7 @@ def run_pipeline_vi(
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # --- Generate timing guide ---
+    # Ghi hướng dẫn chênh lệch thời lượng để chỉnh thủ công trong CapCut.
     timing_guide = _build_timing_guide(report, segments, tts_results)
     timing_path = os.path.join(work_dir, "timing_guide.json")
     with open(timing_path, "w", encoding="utf-8") as f:
@@ -620,6 +790,7 @@ def run_pipeline_vi(
 
 
 def main():
+    """Đọc tham số CLI và chạy pipeline lồng tiếng tiếng Việt."""
     args = parse_args()
     try:
         run_pipeline_vi(
@@ -636,6 +807,8 @@ def main():
             ocr_replace=args.ocr_replace,
             subtitle_y=args.subtitle_y,
             subtitle_size=args.subtitle_size,
+            subtitle_font=args.subtitle_font,
+            subtitle_style=style_overrides_from_args(args),
             ai_blur=args.ai_blur,
         )
     except Exception as e:

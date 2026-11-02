@@ -8,6 +8,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 import os, sys, json, shutil, subprocess, threading, queue, re
 from pathlib import Path
+from src.subtitle_fonts import DEFAULT_FONT, DEFAULT_SIZE, get_font, validate_size
+from src.subtitle_style import (STYLE_DEFAULTS, SUBTITLE_DEFAULTS, SubtitleStyle,
+                                load_project_subtitles, save_project_subtitles)
+from src.storage import Store
+from src.preferences import load_preferences
+from src.voice_registry import options as voice_options, default_reference, resolve as resolve_voice
 
 try:
     from PIL import Image, ImageTk
@@ -20,57 +26,25 @@ ENV_PATH = BASE_DIR / ".env"
 PYTHON   = sys.executable
 OUTPUT_DIR = BASE_DIR / "output" / "VN"
 
-# ─── BẢNG MÀU PREMIUM (Light Slate Theme) ────────────────────────────
-BG            = "#F8FAFC"  # Nền chính (Slate 50)
-WHITE         = "#FFFFFF"  # Nền card/nội dung
-SIDEBAR       = "#FFFFFF"  # Nền thanh bên
-PRIMARY       = "#4F46E5"  # Màu chủ đạo (Indigo 600)
-PRIMARY_HOVER = "#4338CA"  # Indigo 700 khi hover
-PRIMARY_LIGHT = "#EEF2F6"  # Indigo nhạt cho active item
-TEXT          = "#0F172A"  # Chữ chính (Slate 900)
-MUTED         = "#64748B"  # Chữ phụ (Slate 500)
-BORDER        = "#E2E8F0"  # Viền thanh phân cách (Slate 200)
-CARD_BOR      = "#E2E8F0"  # Viền thẻ dự án
-
-# Trạng thái dự án & Wizard
-SUCCESS       = "#10B981"  # Xanh lục (Emerald 500)
-SUCCESS_BG    = "#ECFDF5"  # Emerald 50
-WARN          = "#F59E0B"  # Vàng (Amber 500)
-WARN_BG       = "#FFFBEB"  # Amber 50
-DANGER        = "#EF4444"  # Đỏ (Red 500)
-DANGER_BG     = "#FEF2F2"  # Red 50
-INFO_BG       = "#EFF6FF"  # Blue 50
-
-# Phân mục nhật ký
-LOG_BG        = "#0F172A"  # Slate 900
-LOG_FG        = "#F1F5F9"  # Slate 100
-
-STEP_IDLE     = "#F1F5F9"
-STEP_ACT      = "#DBEAFE"
-STEPS         = ["1. Thiết lập", "2. Chạy ASR", "3. Dịch Thuật", "4. Lồng Tiếng", "5. Hoàn tất"]
-
-# Typography
-FF  = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue"
-FH1 = (FF, 20, "bold")
-FH2 = (FF, 14, "bold")
-FH3 = (FF, 11, "bold")
-FB  = (FF, 10)
-FS  = (FF, 9)
-FM  = ("Courier New" if sys.platform == "win32" else "Menlo", 10)
+# Shared colors and components for the warm, editorial studio UI.
+from studio_ui import (
+    BG, WHITE, SIDEBAR, SIDEBAR_HOVER, SIDEBAR_ACTIVE, SIDEBAR_TEXT,
+    SIDEBAR_MUTED, PRIMARY, PRIMARY_HOVER, PRIMARY_LIGHT, TEXT, MUTED,
+    BORDER, CARD_BOR, SUCCESS, SUCCESS_BG, WARN, WARN_BG, DANGER,
+    DANGER_BG, INFO_BG, LOG_BG, LOG_FG, STEP_IDLE, STEP_ACT,
+    FF, FH1, FH2, FH3, FB, FS, FM, Btn, entry, heading, StudioBanner,
+    empty_art, rounded_rect, Choice,
+)
+STEPS = ["Nguồn video", "Nhận dạng", "Bản dịch", "Lồng tiếng", "Hoàn tất"]
 
 
 def load_env():
-    env = {}
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
-    return env
+    """SQLite owns preferences; .env supplies credentials and legacy imports."""
+    return load_preferences(ENV_PATH)
 
 
 def save_env(new_data):
+    """Cập nhật .env nhưng giữ nguyên các dòng comment và thứ tự hiện có."""
     existing_lines = []
     if ENV_PATH.exists():
         existing_lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
@@ -91,9 +65,12 @@ def save_env(new_data):
         if k not in written:
             out.append(f"{k}={v}")
     ENV_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
+    Store().save_settings(new_data)
+    Store().seed_voices(load_env())
 
 
 def extract_thumbnail(video_path, out_path):
+    """Lấy một frame đại diện bằng FFmpeg để làm thumbnail dự án."""
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(video_path),
@@ -105,6 +82,7 @@ def extract_thumbnail(video_path, out_path):
 
 
 def scan_projects():
+    """Quét thư mục output và trả danh sách dự án Nhật/Việt mới nhất."""
     projects = []
     
     # 1. Quét dự án tiếng Nhật (pipeline.py trực tiếp trong output/)
@@ -125,18 +103,35 @@ def scan_projects():
                 set_status_and_files(proj, folder, "transcript_vi.json")
                 projects.append(proj)
 
+    known = {str(project["path"].resolve()) for project in projects}
+    for record in Store().projects():
+        folder = Path(record["path"])
+        if str(folder) not in known and folder.is_dir():
+            language = record["language"]
+            project = {"path": folder, "name": record["name"], "lang": "VI" if language == "vi" else "JP",
+                       "lang_text": "Tiếng Việt (VI)" if language == "vi" else "Tiếng Nhật (JP)"}
+            set_status_and_files(project, folder, f"transcript_{language}.json")
+            projects.append(project)
+    active_paths = Store().active_project_paths()
+    for project in projects:
+        if str(project["path"].resolve()) in active_paths:
+            project["status"] = "running"
+        language = "vi" if project["lang"] == "VI" else "jp"
+        store = Store()
+        project["database_id"] = store.sync_project(project["path"], language, project["status"])
     # Sắp xếp mtime mới nhất
     projects.sort(key=lambda p: p["path"].stat().st_mtime, reverse=True)
     return projects
 
 
 def set_status_and_files(proj, folder, trans_name):
+    """Suy ra trạng thái dự án và các file thumbnail/video đầu ra."""
     if (folder / "dubbed_video.mp4").exists():
         proj["status"] = "done"
-    elif (folder / trans_name).exists():
-        proj["status"] = "tts"
     elif (folder / "TRANSLATE_PENDING.txt").exists():
         proj["status"] = "pending"
+    elif (folder / trans_name).exists():
+        proj["status"] = "tts"
     elif (folder / "transcript_original.json").exists():
         proj["status"] = "asr_done"
     else:
@@ -153,37 +148,20 @@ def set_status_and_files(proj, folder, trans_name):
 
 
 def flat_sep(parent, **kw):
+    """Tạo đường kẻ phân cách mảnh dùng chung trong giao diện."""
     return tk.Frame(parent, bg=BORDER, height=1, **kw)
 
 
-# ─── NÚT FLAT HIỆN ĐẠI ───────────────────────────────────────────────
-class Btn(tk.Label):
-    def __init__(self, parent, text, command=None, bg=PRIMARY, fg=WHITE, font=FH3, padx=18, pady=8, **kw):
-        super().__init__(parent, text=text, bg=bg, fg=fg, font=font, padx=padx, pady=pady, cursor="hand2", **kw)
-        self.config(relief="flat", highlightthickness=0)
-        self._cmd = command
-        self._bg  = bg
-        self._hbg = self._dark(bg)
-        
-        self.bind("<Button-1>", lambda e: command() if command else None)
-        self.bind("<Enter>",    lambda e: self.config(bg=self._hbg))
-        self.bind("<Leave>",    lambda e: self.config(bg=self._bg))
-
-    @staticmethod
-    def _dark(h):
-        try:
-            r = max(0, int(h[1:3], 16) - 22)
-            g = max(0, int(h[3:5], 16) - 22)
-            b = max(0, int(h[5:7], 16) - 22)
-            return f"#{r:02x}{g:02x}{b:02x}"
-        except Exception:
-            return h
 # ─── KHUNG CUỘN THẨM MỸ ──────────────────────────────────────────────
 class ScrollFrame:
+    """Khung chứa Canvas và scrollbar để cuộn các panel dài của GUI."""
+
     def __init__(self, parent, bg=BG):
+        """Tạo canvas, vùng nội dung bên trong và các binding cuộn chuột."""
         self.outer = tk.Frame(parent, bg=bg)
         self._c = tk.Canvas(self.outer, bg=bg, highlightthickness=0)
-        self._sb = ttk.Scrollbar(self.outer, orient="vertical", command=self._c.yview)
+        self._sb = ttk.Scrollbar(self.outer, orient="vertical", command=self._c.yview,
+                                 style="Studio.Vertical.TScrollbar")
         self._c.configure(yscrollcommand=self._sb.set)
         self._sb.pack(side="right", fill="y")
         self._c.pack(side="left", fill="both", expand=True)
@@ -192,43 +170,131 @@ class ScrollFrame:
         
         self.inner.bind("<Configure>", self._on_configure)
         self._c.bind("<Configure>", self._on_canvas_configure)
-        self._c.bind_all("<MouseWheel>", self._on_mousewheel)
+        self._wheel_bind = self._c.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.outer.bind("<Destroy>", self._on_destroy, add="+")
 
     def _on_configure(self, event):
+        """Cập nhật vùng cuộn theo kích thước nội dung bên trong."""
         self._c.configure(scrollregion=self._c.bbox("all"))
 
     def _on_canvas_configure(self, event):
+        """Ép vùng nội dung rộng bằng canvas để layout không bị co."""
         self._c.itemconfig(self._w, width=event.width)
 
     def _on_mousewheel(self, event):
-        if self.outer.winfo_exists():
-            self._c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        """Only scroll the visible panel under the pointer, including macOS deltas."""
+        if not self.outer.winfo_exists() or not self.outer.winfo_ismapped():
+            return
+        widget = self.outer.winfo_containing(event.x_root, event.y_root)
+        target = widget
+        while target is not None and target is not self.outer:
+            # Text editors and comboboxes retain their own scrolling behavior.
+            if isinstance(target, (tk.Text, ttk.Combobox)):
+                return
+            target = getattr(target, "master", None)
+        if target is not self.outer or not event.delta:
+            return
+        delta = -event.delta if sys.platform == "darwin" else -event.delta / 120
+        self._c.yview_scroll(int(delta) or (-1 if event.delta > 0 else 1), "units")
+
+    def _on_destroy(self, event):
+        if event.widget is self.outer and self._wheel_bind:
+            # Remove this callback only; other scroll frames keep their bindings.
+            self.outer._root()._unbind(("bind", "all", "<MouseWheel>"), self._wheel_bind)
+            self._wheel_bind = None
 
     def reset_scroll(self):
+        """Đưa vị trí cuộn về đầu panel."""
         self._c.yview_moveto(0)
 
 
 # ─── APP CHÍNH ───────────────────────────────────────────────────────
 class App(tk.Tk):
+    """Cửa sổ gốc quản lý sidebar và năm bước của quy trình lồng tiếng."""
+
     def __init__(self):
+        """Khởi tạo theme, menu, các trang và mở trang quản lý dự án."""
         super().__init__()
-        self.title("Auto-Translade-Video Studio")
-        self.geometry("1200x780")
-        self.minsize(1000, 640)
+        self.title("Auto-Dub Studio — Không gian sáng tạo")
+        self.geometry("1320x860")
+        self.minsize(1080, 720)
         self.configure(bg=BG)
         
-        # Style Combobox hiện đại
+        # Style controls đồng bộ với giao diện desktop.
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure("TCombobox", fieldbackground=WHITE, background=BG, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        style.configure(
+            "Studio.TCombobox",
+            fieldbackground=WHITE,
+            background=WHITE,
+            foreground=TEXT,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            arrowcolor=PRIMARY,
+            padding=(12, 9),
+            font=FB,
+        )
+        style.map(
+            "Studio.TCombobox",
+            fieldbackground=[("readonly", WHITE), ("focus", WHITE)],
+            foreground=[("readonly", TEXT)],
+            bordercolor=[("focus", PRIMARY)],
+            lightcolor=[("focus", PRIMARY)],
+            darkcolor=[("focus", PRIMARY)],
+        )
+        style.configure(
+            "Studio.Vertical.TScrollbar",
+            background="#C9CDBE",
+            troughcolor=BG,
+            bordercolor=BG,
+            arrowcolor=MUTED,
+            width=10,
+        )
+        style.layout("Studio.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})
+            ]})
+        ])
         
         self._pages = {}
         self._cur   = None
         self._build_layout()
         self._build_menu()
         self._show("projects")
+        self.protocol("WM_DELETE_WINDOW", self._close_studio)
+        self._bootstrap_after = self.after(250, self._bootstrap_storage)
+
+    def _bootstrap_storage(self):
+        self._bootstrap_after = None
+        Store().recover_interrupted_runs()
+        if not Store().counts()["artifacts"]:
+            self._import_project_data()
+            if "projects" in self._pages:
+                self._pages["projects"]._refresh()
+
+    def _close_studio(self):
+        try:
+            settings = self._pages.get("settings")
+            if settings and settings.flush_autosave() is False:
+                self._show("settings")
+                return
+            wizard = self._pages.get("new")
+            if wizard:
+                wizard.flush_translation_draft()
+        except Exception as error:
+            messagebox.showerror("Chưa lưu được dữ liệu", str(error))
+            return
+        self.destroy()
+
+    def destroy(self):
+        if getattr(self, "_bootstrap_after", None):
+            self.after_cancel(self._bootstrap_after)
+            self._bootstrap_after = None
+        super().destroy()
 
     def _build_menu(self):
+        """Tạo menu hệ thống và các lệnh kiểm tra dịch vụ AI."""
         menubar = tk.Menu(self)
         self.config(menu=menubar)
         
@@ -239,8 +305,107 @@ class App(tk.Tk):
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Công cụ AI", menu=tools_menu)
         tools_menu.add_command(label="Kiểm tra kết nối Gemini API...", command=self._test_gemini_api)
+        tools_menu.add_command(label="Nghe thử giọng đọc...", command=self.open_voice_preview)
+        tools_menu.add_command(label="Phông chữ phụ đề...", command=self.open_subtitle_fonts)
+        tools_menu.add_command(label="Thư viện giọng đọc...", command=self.open_voice_library)
+        tools_menu.add_command(label="Dữ liệu SQLite...", command=self.open_database)
+
+    def _apply_voice(self, language, reference, speed=None):
+        current_settings = self._pages.get("settings")
+        if current_settings and current_settings.flush_autosave() is False:
+            return False
+        environment = load_env()
+        record = resolve_voice(language, reference, environment)
+        values = {"DEFAULT_VOICE_VI" if language == "vi" else "DEFAULT_VOICE_JP": reference}
+        if language == "vi" and reference in ("male", "female"):
+            values["VOICE_TYPE"] = reference
+        elif language == "jp" and not reference.startswith("voice:"):
+            values["TTS_VOICE"] = record["provider_voice_id"]
+        if speed is not None:
+            values["TTS_SPEED"] = f"{speed:g}"
+        save_env(values)
+        if current_settings:
+            current_settings.on_show()
+        wizard = self._pages.get("new")
+        if wizard:
+            wizard._sync_voice_from_settings()
+        return True
+
+    def refresh_voice_library(self):
+        environment = load_env()
+        wizard = self._pages.get("new")
+        if wizard:
+            wizard._refresh_voice_options()
+        preview = getattr(self, "_voice_preview", None)
+        if preview and preview.winfo_exists():
+            preview.refresh_voices(environment)
+
+    def open_voice_library(self):
+        settings = self._pages.get("settings")
+        if settings and settings.flush_autosave() is False:
+            return
+        load_env()
+        from storage_ui import VoiceLibraryDialog
+        if getattr(self, "_voice_library", None) and self._voice_library.winfo_exists():
+            self._voice_library.lift()
+            return
+        self._voice_library = VoiceLibraryDialog(self, self.refresh_voice_library,
+                                                 self.open_voice_preview, self._apply_voice)
+
+    def _import_project_data(self):
+        from src.legacy_import import import_legacy
+        return import_legacy(BASE_DIR, environment=load_env())["projects"]
+
+    def open_database(self):
+        from storage_ui import DatabaseDialog
+        if getattr(self, "_database_dialog", None) and self._database_dialog.winfo_exists():
+            self._database_dialog.refresh()
+            self._database_dialog.lift()
+            return
+        self._database_dialog = DatabaseDialog(self, self._import_project_data)
+
+    def open_subtitle_fonts(self):
+        settings = self._pages.get("settings")
+        if settings and settings.flush_autosave() is False:
+            return
+        if getattr(self, "_font_dialog", None) and self._font_dialog.winfo_exists():
+            self._font_dialog.lift()
+            return
+        from subtitle_font_ui import SubtitleFontDialog
+        def apply_selection(name, size, style):
+            current_settings = self._pages.get("settings")
+            if current_settings and current_settings.flush_autosave() is False:
+                return False
+            save_env({"SUBTITLE_FONT": name, "SUBTITLE_FONT_SIZE": str(size), **style.to_settings()})
+            if current_settings:
+                current_settings.on_show()
+            wizard = self._pages.get("new")
+            if wizard:
+                wizard._sync_subtitle_from_settings()
+            return True
+        self._font_dialog = SubtitleFontDialog(self, load_env(), on_apply=apply_selection)
+
+    def open_voice_preview(self, language="vi", voice=None):
+        settings = self._pages.get("settings")
+        if settings and settings.flush_autosave() is False:
+            return
+        from voice_preview_ui import VoicePreviewDialog
+        if getattr(self, "_voice_preview", None) and self._voice_preview.winfo_exists():
+            self._voice_preview.refresh_voices(load_env(), language, voice)
+            self._voice_preview.lift()
+            return
+        def apply_selection(lang, selected_voice, speed):
+            current_settings = self._pages.get("settings")
+            if current_settings and current_settings.flush_autosave() is False:
+                return False
+            return self._apply_voice(lang, selected_voice, speed)
+        self._voice_preview = VoicePreviewDialog(
+            self, load_env(), language=language, voice=voice, on_apply=apply_selection,
+            on_manage=self.open_voice_library,
+        )
         
     def _test_gemini_api(self):
+        """Kiểm tra kết nối Gemini ở background để không khóa giao diện."""
         from config import GOOGLE_API_KEY, CONTENT_MODEL_ID
         if not GOOGLE_API_KEY:
             messagebox.showerror("Lỗi", "Không tìm thấy GOOGLE_API_KEY. Vui lòng vào 'Cài đặt Hệ thống' để thêm API Key của bạn.")
@@ -286,6 +451,7 @@ class App(tk.Tk):
         threading.Thread(target=_run_test, daemon=True).start()
 
     def _test_system_status(self):
+        """Kiểm tra FFmpeg, thư viện AI và các API key cơ bản."""
         def _run_checks():
             results = []
             
@@ -313,13 +479,15 @@ class App(tk.Tk):
 
             # 4. Kiểm tra API Keys cơ bản
             from config import GOOGLE_API_KEY, VIETNAMESE_API_KEY
+            import config as runtime_config
+            vietnamese_key_count = len(getattr(runtime_config, "VIETNAMESE_API_KEYS", ()) or ())
             if GOOGLE_API_KEY:
                 results.append("✅ Gemini API Key: Đã cấu hình")
             else:
-                results.append("⚠️ Gemini API Key: Chưa cấu hình (Tính năng tự động dịch sẽ không hoạt động)")
+                results.append("⚠️ Gemini API Key: Chưa cấu hình (chỉ ảnh/mô tả tuỳ chọn)")
                 
-            if VIETNAMESE_API_KEY:
-                results.append("✅ LucyLab TTS API Key: Đã cấu hình")
+            if VIETNAMESE_API_KEY or vietnamese_key_count:
+                results.append(f"✅ LucyLab TTS API Key: Đã cấu hình ({vietnamese_key_count} key, có dự phòng tự động)")
             else:
                 results.append("⚠️ LucyLab TTS API Key: Chưa cấu hình (Giọng đọc tiếng Việt có thể không hoạt động)")
 
@@ -332,80 +500,145 @@ class App(tk.Tk):
 
 
     def _build_layout(self):
-        # Sidebar thanh bên cực đẹp
-        self.sb_frame = tk.Frame(self, bg=SIDEBAR, width=240, highlightbackground=BORDER, highlightthickness=1)
+        self.sb_frame = tk.Frame(self, bg=SIDEBAR, width=218)
         self.sb_frame.pack(side="left", fill="y")
         self.sb_frame.pack_propagate(False)
-        
-        # Logo header của sidebar
-        logo_container = tk.Frame(self.sb_frame, bg=SIDEBAR, padx=24, pady=24)
-        logo_container.pack(fill="x")
-        tk.Label(logo_container, text="A U T O - D U B", font=(FF, 14, "bold"), bg=SIDEBAR, fg=PRIMARY, anchor="w").pack(fill="x")
-        tk.Label(logo_container, text="Lồng tiếng & Dịch thuật Video", font=FS, bg=SIDEBAR, fg=MUTED, anchor="w").pack(fill="x", pady=(2, 0))
-        
-        flat_sep(self.sb_frame).pack(fill="x", padx=16)
-        
-        # Sidebar Items
-        self._nav = {}
-        self._stripes = {}
-        menu_items = [
-            ("projects", "Quản lý Dự án"),
-            ("new", "Tạo Dự án Mới"),
-            ("settings", "Cài đặt Hệ thống")
-        ]
-        
-        menu_container = tk.Frame(self.sb_frame, bg=SIDEBAR, pady=16)
-        menu_container.pack(fill="both", expand=True)
-        
-        for key, label in menu_items:
-            # Container của từng dòng menu
-            item_frame = tk.Frame(menu_container, bg=SIDEBAR, height=48, cursor="hand2")
-            item_frame.pack(fill="x", pady=2)
-            item_frame.pack_propagate(False)
-            
-            # Vạch màu bên trái khi active
-            stripe = tk.Frame(item_frame, bg=SIDEBAR, width=4)
-            stripe.pack(side="left", fill="y")
-            self._stripes[key] = stripe
-            
-            # Nhãn chữ
-            lbl = tk.Label(item_frame, text=label, font=FB, bg=SIDEBAR, fg=MUTED, anchor="w", padx=18)
-            lbl.pack(side="left", fill="both", expand=True)
-            self._nav[key] = lbl
-            
-            # Event binding
-            for widget in (item_frame, lbl):
+        brand = tk.Frame(self.sb_frame, bg=SIDEBAR)
+        brand.pack(fill="x", padx=22, pady=(29, 30))
+        mark = tk.Canvas(brand, width=36, height=38, bg=SIDEBAR, highlightthickness=0)
+        mark.pack(side="left", padx=(0, 10))
+        rounded_rect(mark, 0, 1, 36, 37, 10, fill=PRIMARY, outline=PRIMARY)
+        for x, h in ((10, 10), (15, 20), (21, 14), (26, 7)):
+            mark.create_line(x, 19-h/2, x, 19+h/2, fill=WHITE, width=2, capstyle="round")
+        text = tk.Frame(brand, bg=SIDEBAR)
+        text.pack(side="left")
+        tk.Label(text, text="auto-dub", font=(FF, 19, "bold"), bg=SIDEBAR,
+                 fg=TEXT).pack(anchor="w")
+        tk.Label(text, text="YOUR VIDEO, REIMAGINED", font=(FF, 7, "bold"),
+                 bg=SIDEBAR, fg=MUTED).pack(anchor="w", pady=(1, 0))
+        Btn(self.sb_frame, "＋  Tạo video mới", command=self.reset_new,
+            padx=20, pady=11).pack(fill="x", padx=18, pady=(0, 29))
+        tk.Label(self.sb_frame, text="KHÔNG GIAN LÀM VIỆC", font=(FF, 8, "bold"),
+                 bg=SIDEBAR, fg=SIDEBAR_MUTED).pack(anchor="w", padx=25, pady=(0, 10))
+        self._nav, self._nav_frames, self._stripes = {}, {}, {}
+        for key, icon, label in (("projects", "▦", "Thư viện video"),
+                                 ("new", "↗", "Phòng lồng tiếng"),
+                                 ("settings", "⚙", "Cài đặt")):
+            frame = tk.Frame(self.sb_frame, bg=SIDEBAR, height=47, cursor="hand2",
+                             highlightthickness=0)
+            frame.pack(fill="x", padx=13, pady=3)
+            frame.pack_propagate(False)
+            stripe = tk.Frame(frame, bg=SIDEBAR, width=3)
+            stripe.pack(side="left", fill="y", pady=12)
+            glyph = tk.Label(frame, text=icon, font=(FF, 17), bg=SIDEBAR,
+                             fg=SIDEBAR_MUTED, width=3)
+            glyph.pack(side="left", padx=(4, 1))
+            label_widget = tk.Label(frame, text=label, font=(FF, 11),
+                                    bg=SIDEBAR, fg=SIDEBAR_MUTED, anchor="w")
+            label_widget.pack(side="left", fill="both", expand=True)
+            self._nav[key], self._nav_frames[key], self._stripes[key] = label_widget, frame, stripe
+            for widget in (frame, glyph, label_widget):
                 widget.bind("<Button-1>", lambda e, k=key: self._show(k))
-                widget.bind("<Enter>",    lambda e, k=key, f=item_frame: self._on_menu_enter(k, f))
-                widget.bind("<Leave>",    lambda e, k=key, f=item_frame: self._on_menu_leave(k, f))
-            
-        self.content = tk.Frame(self, bg=BG)
-        self.content.pack(side="left", fill="both", expand=True)
+                widget.bind("<Enter>", lambda e, k=key, f=frame: self._on_menu_enter(k, f))
+                widget.bind("<Leave>", lambda e, k=key, f=frame: self._on_menu_leave(k, f))
+            frame.configure(takefocus=True)
+            frame.bind("<Return>", lambda e, k=key: self._show(k))
+            frame.bind("<space>", lambda e, k=key: self._show(k))
+        footer = tk.Frame(self.sb_frame, bg=SIDEBAR)
+        footer.pack(side="bottom", fill="x", padx=22, pady=24)
+        flat_sep(footer).pack(fill="x", pady=(0, 18))
+        tk.Label(footer, text="Được tạo cho câu chuyện của bạn.", font=(FF, 9),
+                 bg=SIDEBAR, fg=MUTED, wraplength=168, justify="left").pack(anchor="w")
+        tk.Label(footer, text="AUTO-DUB STUDIO  /  DESKTOP", font=(FF, 7, "bold"),
+                 bg=SIDEBAR, fg=SIDEBAR_MUTED).pack(anchor="w", pady=(13, 0))
+        workspace = tk.Frame(self, bg=BG)
+        workspace.pack(side="left", fill="both", expand=True)
+        self.topbar = tk.Frame(workspace, bg=BG, height=58)
+        self.topbar.pack(fill="x", padx=32)
+        self.topbar.pack_propagate(False)
+        tk.Label(self.topbar, text="Workspace  /", font=FS, bg=BG, fg=MUTED).pack(side="left")
+        self._page_title = tk.Label(self.topbar, text="Thư viện video", font=(FF, 10, "bold"), bg=BG, fg=TEXT)
+        self._page_title.pack(side="left", padx=8)
+        self._page_hint = tk.Label(self.topbar, text="", bg=BG)
+        tk.Label(self.topbar, text="●  Lưu trên thiết bị", font=(FF, 9),
+                 bg=BG, fg=MUTED).pack(side="right")
+        flat_sep(workspace).pack(fill="x", padx=32)
+        self.content = tk.Frame(workspace, bg=BG)
+        self.content.pack(fill="both", expand=True)
 
     def _on_menu_enter(self, key, frame):
+        """Đổi màu dòng menu khi con trỏ đi vào, trừ mục đang active."""
         if key != self._cur:
-            frame.config(bg=PRIMARY_LIGHT)
-            self._nav[key].config(bg=PRIMARY_LIGHT)
+            frame.config(bg=SIDEBAR_HOVER)
+            frame.config(highlightbackground=SIDEBAR_HOVER)
+            self._nav[key].config(bg=SIDEBAR_HOVER)
+            for child in frame.winfo_children():
+                child.config(bg=SIDEBAR_HOVER)
+                if isinstance(child, tk.Frame):
+                    for grandchild in child.winfo_children():
+                        grandchild.config(bg=SIDEBAR_HOVER)
 
     def _on_menu_leave(self, key, frame):
+        """Khôi phục màu dòng menu khi con trỏ rời khỏi."""
         if key != self._cur:
             frame.config(bg=SIDEBAR)
+            frame.config(highlightbackground=SIDEBAR)
             self._nav[key].config(bg=SIDEBAR)
+            for child in frame.winfo_children():
+                if child is not self._stripes[key]:
+                    child.config(bg=SIDEBAR)
+                    if isinstance(child, tk.Frame):
+                        for grandchild in child.winfo_children():
+                            grandchild.config(bg=SIDEBAR)
 
     def _show(self, key):
+        """Chuyển sang trang được chọn và đồng bộ trạng thái menu."""
+        # Ghi ngay lần lưu cấu hình đang chờ debounce trước khi rời trang.
+        # Nhờ vậy voice/API vừa sửa sẽ có sẵn cho subprocess pipeline tiếp theo,
+        # kể cả khi người dùng chuyển trang ngay lập tức.
+        if self._cur == "settings" and self._cur in self._pages:
+            page = self._pages[self._cur]
+            if hasattr(page, "flush_autosave"):
+                if page.flush_autosave() is False:
+                    return
+        if self._cur == "new" and "new" in self._pages:
+            self._pages["new"].flush_translation_draft()
         if self._cur:
             if self._cur in self._pages:
                 self._pages[self._cur].pack_forget()
             # Reset menu trước đó về trạng thái thường
-            self._nav[self._cur].master.config(bg=SIDEBAR)
-            self._nav[self._cur].config(bg=SIDEBAR, fg=MUTED, font=FB)
+            previous_frame = self._nav_frames.get(self._cur, self._nav[self._cur].master)
+            previous_frame.config(bg=SIDEBAR, highlightbackground=SIDEBAR)
+            self._nav[self._cur].config(bg=SIDEBAR, fg=SIDEBAR_MUTED, font=FB)
             self._stripes[self._cur].config(bg=SIDEBAR)
+            for child in previous_frame.winfo_children():
+                if child is not self._stripes[self._cur]:
+                    child.config(bg=SIDEBAR)
+                    if isinstance(child, tk.Frame):
+                        for grandchild in child.winfo_children():
+                            grandchild.config(bg=SIDEBAR)
             
         self._cur = key
         # Active menu hiện tại
-        self._nav[key].master.config(bg=PRIMARY_LIGHT)
-        self._nav[key].config(bg=PRIMARY_LIGHT, fg=PRIMARY, font=(FF, 10, "bold"))
+        active_frame = self._nav_frames.get(key, self._nav[key].master)
+        active_frame.config(bg=SIDEBAR_ACTIVE, highlightbackground=SIDEBAR_ACTIVE)
+        self._nav[key].config(bg=SIDEBAR_ACTIVE, fg=TEXT, font=(FF, 11, "bold"))
         self._stripes[key].config(bg=PRIMARY)
+        for child in active_frame.winfo_children():
+            child.config(bg=SIDEBAR_ACTIVE)
+            if isinstance(child, tk.Frame):
+                for grandchild in child.winfo_children():
+                    grandchild.config(bg=SIDEBAR_ACTIVE)
+
+        page_titles = {
+            "projects": ("Thư viện video", "Theo dõi tiến độ và quản lý video đầu ra"),
+            "new": ("Phòng lồng tiếng", "Thiết lập nguồn, dịch thuật và lồng tiếng theo quy trình"),
+            "settings": ("Cài đặt", "Quản lý API, voice và tham số xử lý"),
+        }
+        if hasattr(self, "_page_title"):
+            title, hint = page_titles[key]
+            self._page_title.config(text=title)
+            self._page_hint.config(text=hint)
         
         if key not in self._pages:
             cls = {"projects": ProjectsPage, "new": NewProjectPage, "settings": SettingsPage}[key]
@@ -416,6 +649,7 @@ class App(tk.Tk):
             self._pages[key].on_show()
 
     def reset_new(self):
+        """Xóa instance trang tạo dự án cũ và dựng lại form trống."""
         if "new" in self._pages:
             self._pages["new"].destroy()
             del self._pages["new"]
@@ -435,165 +669,211 @@ class App(tk.Tk):
 # ══════════════════════════════════════════════════════
 
 class ProjectsPage(tk.Frame):
+    """Trang hiển thị dự án, trạng thái xử lý, preview và thao tác tải xuống."""
     STATUS_INFO = {
         "done":     ("Hoàn thành", SUCCESS, SUCCESS_BG),
         "tts":      ("Tổng hợp giọng", WARN, WARN_BG),
-        "pending":  ("Chờ dịch JSON", PRIMARY, INFO_BG),
-        "asr_done": ("Tách âm hoàn tất", PRIMARY, PRIMARY_LIGHT),
-        "running":  ("Đang phân tích", WARN, WARN_BG),
+        "pending":  ("Chờ bản dịch", PRIMARY, INFO_BG),
+        "asr_done": ("Đã nhận dạng", PRIMARY, PRIMARY_LIGHT),
+        "running":  ("Đang xử lý", WARN, WARN_BG),
         "unknown":  ("Không xác định", MUTED, STEP_IDLE),
     }
 
     def __init__(self, parent, app):
+        """Khởi tạo trang thư viện và dựng layout card."""
         super().__init__(parent, bg=BG)
         self.app = app
         self._ph = {}
         self._build()
 
     def _build(self):
-        hdr = tk.Frame(self, bg=BG, padx=40, pady=24)
-        hdr.pack(fill="x")
-        
-        tk.Label(hdr, text="Thư viện Dự án", font=FH1, bg=BG, fg=TEXT).pack(side="left")
-        Btn(hdr, "Tạo Dự án Mới", command=self.app.reset_new, bg=PRIMARY).pack(side="right")
-        
-        flat_sep(self).pack(fill="x", padx=40)
-        
+        self._projects = []
+        self._columns = 0
+        self._resize_after = None
+        self._search = tk.StringVar()
+        self._filter = "all"
+        self._search.trace_add("write", lambda *_: self._render_projects(reset_scroll=True))
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x", padx=32, pady=(24, 22))
+        heading(hdr, "THƯ VIỆN CỦA BẠN", "Những câu chuyện đang tạo.",
+                "Tất cả video và hành trình chuyển ngữ, ở cùng một nơi.").pack(side="left")
+        StudioBanner(self).pack(fill="x", padx=32, pady=(0, 24))
+        title_row = tk.Frame(self, bg=BG)
+        title_row.pack(fill="x", padx=32, pady=(0, 12))
+        tk.Label(title_row, text="Dự án của bạn", font=FH2, bg=BG, fg=TEXT).pack(side="left")
+        self._summary = tk.Label(title_row, text="", font=FS, bg=BG, fg=MUTED)
+        self._summary.pack(side="left", padx=14)
+        Btn(title_row, "↻  Làm mới", command=self._refresh, bg=BG, fg=MUTED,
+            padx=8, pady=5, font=FS).pack(side="right")
+        tools = tk.Frame(self, bg=BG)
+        tools.pack(fill="x", padx=32, pady=(0, 14))
+        self._filter_buttons = {}
+        for key, label in (("all", "Tất cả"), ("pending", "Chờ dịch"), ("active", "Đang làm"), ("done", "Hoàn tất")):
+            btn = Btn(tools, label, command=lambda k=key: self._set_filter(k),
+                      bg=TEXT if key == "all" else BG,
+                      fg=WHITE if key == "all" else MUTED, font=FS, padx=13, pady=7)
+            btn.pack(side="left", padx=(0, 5))
+            self._filter_buttons[key] = btn
+        search_box = tk.Frame(tools, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
+        search_box.pack(side="right")
+        tk.Label(search_box, text="⌕", font=(FF, 18), bg=WHITE, fg=MUTED).pack(side="left", padx=(9, 2))
+        search = tk.Entry(search_box, textvariable=self._search, font=FS, bg=WHITE,
+                          fg=TEXT, insertbackground=PRIMARY, relief="flat", width=21, bd=7)
+        search.pack(side="left")
+        search.bind("<Escape>", lambda e: self._search.set(""))
+        search.bind("<FocusIn>", lambda e: search_box.config(highlightbackground=PRIMARY))
+        search.bind("<FocusOut>", lambda e: search_box.config(highlightbackground=BORDER))
+        self._search_hint = tk.Label(search_box, text="Tìm dự án…", font=FS,
+                                     bg=WHITE, fg=MUTED, cursor="xterm")
+        self._search_hint.place(x=33, rely=.5, anchor="w")
+        self._search_hint.bind("<Button-1>", lambda e: search.focus_set())
+        def update_hint(*_):
+            if self._search.get() or search.focus_get() is search:
+                self._search_hint.place_forget()
+            else:
+                self._search_hint.place(x=33, rely=.5, anchor="w")
+        self._search.trace_add("write", update_hint)
+        search.bind("<FocusIn>", update_hint, add="+")
+        search.bind("<FocusOut>", update_hint, add="+")
         self._sf = ScrollFrame(self, bg=BG)
-        self._sf.outer.pack(fill="both", expand=True, padx=30, pady=12)
+        self._sf.outer.pack(fill="both", expand=True, padx=24, pady=(0, 12))
         self._grid = self._sf.inner
+        self._sf._c.bind("<Configure>", self._on_grid_resize, add="+")
+        self.bind("<Destroy>", self._cancel_resize, add="+")
+
+    def _cancel_resize(self, event):
+        if event.widget is self and self._resize_after:
+            self.after_cancel(self._resize_after)
+            self._resize_after = None
+
+    def _set_filter(self, key):
+        self._filter = key
+        for name, button in self._filter_buttons.items():
+            button.config(bg=TEXT if name == key else BG, fg=WHITE if name == key else MUTED)
+        self._render_projects(reset_scroll=True)
+
+    def _on_grid_resize(self, event):
+        columns = 3 if event.width >= 990 else 2 if event.width >= 580 else 1
+        if columns != self._columns:
+            if self._resize_after:
+                self.after_cancel(self._resize_after)
+            self._resize_after = self.after(100, self._render_projects)
 
     def on_show(self):
+        """Làm mới danh sách ngay khi người dùng quay lại trang."""
         self._refresh()
 
     def _refresh(self):
-        for w in self._grid.winfo_children():
-            w.destroy()
+        self._projects = scan_projects()
+        done = sum(project.get("status") == "done" for project in self._projects)
+        self._summary.config(text=f"{len(self._projects)} dự án  ·  {done} hoàn tất")
+        self._render_projects()
+
+    def _render_projects(self, reset_scroll=False):
+        self._resize_after = None
+        for widget in self._grid.winfo_children():
+            widget.destroy()
         self._ph.clear()
-        
-        projects = scan_projects()
+        width = self._sf._c.winfo_width()
+        self._columns = cols = 3 if width >= 990 else 2 if width >= 580 else 1
+        for column in range(3):
+            self._grid.columnconfigure(column, weight=1 if column < cols else 0,
+                                       uniform="project" if column < cols else "", minsize=0)
+        query = self._search.get().strip().casefold()
+        projects = []
+        for project in self._projects:
+            status = project.get("status")
+            if query and query not in (project["name"] + " " + project["lang_text"]).casefold():
+                continue
+            if self._filter == "active" and status in ("done", "pending"):
+                continue
+            if self._filter in ("pending", "done") and status != self._filter:
+                continue
+            projects.append(project)
         if not projects:
-            empty_frame = tk.Frame(self._grid, bg=BG)
-            empty_frame.pack(expand=True, fill="both", pady=80)
-            tk.Label(empty_frame, text="Chưa có dự án nào.", font=FH2, bg=BG, fg=MUTED).pack()
-            tk.Label(empty_frame, text="Nhấp vào nút 'Tạo Dự án Mới' để bắt đầu quy trình lồng tiếng.", font=FB, bg=BG, fg=MUTED, pady=8).pack()
-            return
-            
-        COLS = 3
-        for i, proj in enumerate(projects):
-            row, col = divmod(i, COLS)
-            card = self._make_card(self._grid, proj)
-            card.grid(row=row, column=col, padx=12, pady=12, sticky="nsew")
-            
-        for c in range(COLS):
-            self._grid.columnconfigure(c, weight=1)
+            empty = tk.Frame(self._grid, bg=WHITE, highlightbackground=BORDER,
+                              highlightthickness=1, padx=20, pady=24)
+            empty.grid(row=0, column=0, columnspan=cols, sticky="ew", padx=8, pady=5)
+            empty_art(empty).pack()
+            has_projects = bool(self._projects)
+            tk.Label(empty, text="Không tìm thấy dự án" if has_projects else "Câu chuyện đầu tiên bắt đầu từ đây.",
+                     font=FH2, bg=WHITE, fg=TEXT).pack(pady=(10, 6))
+            tk.Label(empty, text="Thử tên khác hoặc chọn lại bộ lọc." if has_projects else "Thêm một video. Chọn giọng đọc. Tạo phiên bản của riêng bạn.",
+                     font=FB, bg=WHITE, fg=MUTED).pack()
+            Btn(empty, "Xóa bộ lọc" if has_projects else "＋  Tạo video đầu tiên",
+                command=self._clear_filters if has_projects else self.app.reset_new,
+                pady=9).pack(pady=(18, 0))
+        else:
+            for i, project in enumerate(projects):
+                card = self._make_card(self._grid, project)
+                card.grid(row=i // cols, column=i % cols, padx=8, pady=(3, 16), sticky="nsew")
+        if reset_scroll:
+            self._sf.reset_scroll()
+
+    def _clear_filters(self):
+        self._search.set("")
+        self._set_filter("all")
 
     def _make_card(self, parent, proj):
-        # Card chính với viền bo mượt mà và hiệu ứng Hover
         card = tk.Frame(parent, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
-        
-        st = proj.get("status", "unknown")
-        
-        # Ảnh thumbnail của video gốc — có thể click để xem preview
-        tbg = tk.Frame(card, bg="#F1F5F9", height=155)
-        tbg.pack(fill="x")
-        tbg.pack_propagate(False)
-        
+        status = proj.get("status", "unknown")
+        status_label, status_color, status_bg = self.STATUS_INFO.get(status, ("Chưa xác định", MUTED, STEP_IDLE))
+        preview = tk.Frame(card, bg=LOG_BG, height=172)
+        preview.pack(fill="x", padx=8, pady=(8, 0))
+        preview.pack_propagate(False)
         thumb_loaded = False
-        if HAS_PIL and proj["thumbnail"] and proj["thumbnail"].exists():
+        if HAS_PIL and proj.get("thumbnail") and proj["thumbnail"].exists():
             try:
-                img = Image.open(proj["thumbnail"])
-                img.thumbnail((360, 155), Image.Resampling.LANCZOS)
-                ph = ImageTk.PhotoImage(img)
-                self._ph[str(proj["path"])] = ph
-                thumb_lbl = tk.Label(tbg, image=ph, bg="#F1F5F9", cursor="hand2")
-                thumb_lbl.pack(expand=True)
+                with Image.open(proj["thumbnail"]) as original:
+                    image = original.copy()
+                image.thumbnail((480, 172), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+                self._ph[str(proj["path"])] = photo
+                thumb = tk.Label(preview, image=photo, bg=LOG_BG, cursor="hand2")
+                thumb.pack(expand=True)
                 thumb_loaded = True
-            except Exception:
+            except (OSError, ValueError):
                 pass
-        
         if not thumb_loaded:
-            thumb_lbl = tk.Label(tbg, text="📺", font=(FF, 32), bg="#F1F5F9", fg=MUTED, cursor="hand2")
-            thumb_lbl.pack(expand=True)
-        
-        # Overlay nút Play trên thumbnail nếu có video để xem
-        _video_to_preview = proj["dubbed_video"] or self._find_source_video(proj)
-        if _video_to_preview:
-            # Nút play overlay
-            _play_bg       = "#1E293B" if thumb_loaded else "#CBD5E1"
-            _play_bg_hover = "#0F172A" if thumb_loaded else "#94A3B8"
-            play_overlay = tk.Label(tbg, text="▶", font=(FF, 24, "bold"),
-                                    bg=_play_bg,
-                                    fg=WHITE, cursor="hand2", padx=10, pady=6)
-            play_overlay.place(relx=0.5, rely=0.5, anchor="center")
-            play_overlay.bind("<Button-1>", lambda e, p=proj: self._preview_video(p))
-            thumb_lbl.bind("<Button-1>", lambda e, p=proj: self._preview_video(p))
-            play_overlay.bind("<Enter>",  lambda e, w=play_overlay, hbg=_play_bg_hover: w.config(bg=hbg))
-            play_overlay.bind("<Leave>",  lambda e, w=play_overlay, nbg=_play_bg: w.config(bg=nbg))
-
-        # Phần nội dung
-        info = tk.Frame(card, bg=WHITE, padx=18, pady=14)
+            thumb = tk.Label(preview, text="▷", font=(FF, 36), bg=LOG_BG, fg="#BCCA9C", cursor="hand2")
+            thumb.pack(expand=True)
+        tk.Label(preview, text="VI" if proj["lang"] == "VI" else "JP", bg=WHITE, fg=TEXT,
+                 font=(FF, 8, "bold"), padx=7, pady=4).place(x=10, y=10)
+        video = proj["dubbed_video"] or self._find_source_video(proj)
+        if video:
+            thumb.bind("<Button-1>", lambda e: self._preview_video(proj))
+            play = tk.Label(preview, text="▶", font=(FF, 16), bg=LOG_BG, fg=WHITE,
+                            cursor="hand2", padx=10, pady=6)
+            play.place(relx=.5, rely=.5, anchor="center")
+            play.bind("<Button-1>", lambda e: self._preview_video(proj))
+        info = tk.Frame(card, bg=WHITE, padx=16, pady=14)
         info.pack(fill="x")
-        
-        # Tiêu đề dự án (Tên folder)
-        tk.Label(info, text=proj["name"], font=FH2, bg=WHITE, fg=TEXT, anchor="w", wraplength=250).pack(fill="x")
-        
-        # Badges ngôn ngữ & Trạng thái nằm cạnh nhau
-        badge_row = tk.Frame(info, bg=WHITE, pady=10)
-        badge_row.pack(fill="x")
-        
-        # Nhãn ngôn ngữ
-        tk.Label(badge_row, text=f" {proj['lang_text']} ", font=FS, bg="#F1F5F9", fg=PRIMARY, padx=6, pady=3).pack(side="left")
-        
-        # Nhãn trạng thái
-        lbl, color, bbg = self.STATUS_INFO.get(st, ("Không rõ", MUTED, STEP_IDLE))
-        tk.Label(badge_row, text=f" {lbl} ", font=FS, bg=bbg, fg=color, padx=6, pady=3).pack(side="left", padx=(8, 0))
-        
-        # Banner "Chưa hoàn thành" nếu dự án đang dở
-        if st != "done":
-            banner = tk.Frame(card, bg=WARN_BG, padx=18, pady=8)
-            banner.pack(fill="x")
-            tk.Label(banner, text="⚠️  Dự án chưa hoàn thành — nhấn Tiếp tục để hoàn thiện",
-                     font=FS, bg=WARN_BG, fg="#92400E", anchor="w").pack(fill="x")
-        
-        # Dòng các nút hành động dưới đáy
-        btn_row = tk.Frame(card, bg=WHITE, padx=18, pady=12)
-        btn_row.pack(fill="x")
-        
-        flat_sep(card).pack(fill="x", before=btn_row)
-        
+        name = tk.Label(info, text=proj["name"], font=(FF, 12, "bold"), bg=WHITE,
+                         fg=TEXT, anchor="w", justify="left", wraplength=260)
+        name.pack(fill="x")
+        info.bind("<Configure>", lambda e: name.config(wraplength=max(150, e.width-32)))
+        try:
+            import datetime
+            updated = datetime.datetime.fromtimestamp(proj["path"].stat().st_mtime).strftime("%d.%m.%Y")
+        except OSError:
+            updated = ""
+        tk.Label(info, text=f"{proj['lang_text']}  ·  {updated}", font=(FF, 9),
+                 bg=WHITE, fg=MUTED, anchor="w").pack(fill="x", pady=(6, 12))
+        tk.Label(info, text=f"●  {status_label}", font=(FF, 9), bg=status_bg,
+                 fg=status_color, padx=9, pady=5).pack(anchor="w")
+        flat_sep(card).pack(fill="x", padx=16)
+        actions = tk.Frame(card, bg=WHITE, padx=10, pady=8)
+        actions.pack(fill="x", side="bottom")
         if proj["dubbed_video"]:
-            # Nút Xem Video (chỉ có khi đã có video hoàn chỉnh)
-            pv = tk.Label(btn_row, text="🎬 Xem", font=FS, bg=WHITE, fg="#7C3AED", cursor="hand2")
-            pv.pack(side="left")
-            pv.bind("<Button-1>", lambda e, p=proj: self._preview_video(p))
-            pv.bind("<Enter>", lambda e, w=pv: w.config(fg="#5B21B6"))
-            pv.bind("<Leave>", lambda e, w=pv: w.config(fg="#7C3AED"))
-            
-            dl = tk.Label(btn_row, text="⬇ Tải xuống", font=FS, bg=WHITE, fg=PRIMARY, cursor="hand2")
-            dl.pack(side="left", padx=(14, 0))
-            dl.bind("<Button-1>", lambda e, p=proj: self._download(p))
-            dl.bind("<Enter>", lambda e, w=dl: w.config(fg=PRIMARY_HOVER))
-            dl.bind("<Leave>", lambda e, w=dl: w.config(fg=PRIMARY))
-        elif st != "done":
-            # Nút Tiếp tục cho dự án chưa xong
-            cont = tk.Label(btn_row, text="▶ Tiếp tục", font=(FS[0], FS[1], "bold"),
-                            bg=WARN_BG, fg=WARN, cursor="hand2", padx=10, pady=4)
-            cont.pack(side="left")
-            cont.bind("<Button-1>", lambda e, p=proj: self.app.continue_project(p))
-            cont.bind("<Enter>", lambda e, w=cont: w.config(bg="#FDE68A"))
-            cont.bind("<Leave>", lambda e, w=cont: w.config(bg=WARN_BG))
-            
-        tk.Frame(btn_row, bg=WHITE).pack(side="left", expand=True)
-        
-        d = tk.Label(btn_row, text="🗑 Xoá", font=FS, bg=WHITE, fg=DANGER, cursor="hand2")
-        d.pack(side="right")
-        d.bind("<Button-1>", lambda e, p=proj: self._delete(p))
-        
-        # Tạo hiệu ứng đổi màu viền khi hover chuột vào Card
-        card.bind("<Enter>", lambda e, c=card: c.config(highlightbackground=PRIMARY))
-        card.bind("<Leave>", lambda e, c=card: c.config(highlightbackground=BORDER))
-        
+            Btn(actions, "Xem video", command=lambda: self._preview_video(proj),
+                bg=PRIMARY_LIGHT, fg=PRIMARY, font=FS, padx=10, pady=7).pack(side="left")
+            Btn(actions, "Tải xuống", command=lambda: self._download(proj),
+                bg=WHITE, fg=TEXT, font=FS, padx=8, pady=7).pack(side="left", padx=4)
+        else:
+            Btn(actions, "Tiếp tục  ↗", command=lambda: self.app.continue_project(proj),
+                bg=PRIMARY_LIGHT, fg=PRIMARY, font=FS, padx=12, pady=7).pack(side="left")
+        Btn(actions, "Xóa", command=lambda: self._delete(proj), bg=WHITE,
+            fg=DANGER, font=(FF, 9), padx=7, pady=7).pack(side="right")
         return card
 
     def _find_source_video(self, proj):
@@ -613,11 +893,15 @@ class ProjectsPage(tk.Frame):
         VideoPlayerDialog(self, proj, Path(video_path))
 
     def _delete(self, proj):
+        """Xóa toàn bộ thư mục dự án sau khi người dùng xác nhận."""
         if messagebox.askyesno("Xoá dự án", f"Bạn có chắc chắn muốn xoá dự án '{proj['name']}'?\nThao tác này sẽ xoá bỏ hoàn toàn các tệp tin lưu trên đĩa."):
             shutil.rmtree(proj["path"], ignore_errors=True)
+            if not proj["path"].exists():
+                Store().mark_project_deleted(proj["path"])
             self._refresh()
 
     def _download(self, proj):
+        """Sao chép video đã lồng tiếng sang thư mục người dùng chọn."""
         dst_dir = filedialog.askdirectory(title="Chọn thư mục đích để lưu video lồng tiếng")
         if dst_dir:
             dst = Path(dst_dir) / f"{proj['name']}_dubbed.mp4"
@@ -636,25 +920,28 @@ class VideoPlayerDialog:
     """Cửa sổ popup xem video — hiển thị thông tin + nút mở bằng player hệ thống."""
 
     def __init__(self, parent, proj, video_path: Path):
+        """Dựng popup thông tin/thumbnail và các nút mở hoặc tải video."""
         self.proj = proj
         self.video_path = video_path
 
         dlg = tk.Toplevel(parent)
-        dlg.title(f"🎬 Xem Video — {proj['name']}")
-        dlg.configure(bg=WHITE)
+        dlg.title(f"Auto-Dub  |  {proj['name']}")
+        dlg.configure(bg=BG)
         dlg.transient(parent)
         dlg.grab_set()
         dlg.resizable(False, False)
         self.dlg = dlg
 
-        # ── Header ──
-        hdr = tk.Frame(dlg, bg=PRIMARY, padx=24, pady=16)
+        # ── Header thông tin dự án ──
+        hdr = tk.Frame(dlg, bg=BG, padx=24, pady=20)
         hdr.pack(fill="x")
-        tk.Label(hdr, text=f"🎬  {proj['name']}", font=FH2, bg=PRIMARY, fg=WHITE, anchor="w").pack(fill="x")
-        tk.Label(hdr, text=proj.get("lang_text", ""), font=FS, bg=PRIMARY, fg="#C7D2FE", anchor="w").pack(fill="x")
+        tk.Label(hdr, text=f"XEM TRƯỚC  /  {proj['name']}", font=(FF, 13, "bold"),
+                 bg=BG, fg=TEXT, anchor="w").pack(fill="x")
+        tk.Label(hdr, text=proj.get("lang_text", ""), font=FS, bg=BG,
+                 fg=SIDEBAR_MUTED, anchor="w").pack(fill="x", pady=(3, 0))
 
         # ── Thumbnail preview lớn ──
-        thumb_frame = tk.Frame(dlg, bg="#0F172A", width=560, height=315)
+        thumb_frame = tk.Frame(dlg, bg=LOG_BG, width=560, height=315)
         thumb_frame.pack(fill="x")
         thumb_frame.pack_propagate(False)
 
@@ -665,14 +952,14 @@ class VideoPlayerDialog:
                 img.thumbnail((560, 315), Image.Resampling.LANCZOS)
                 ph = ImageTk.PhotoImage(img)
                 dlg._thumb_ph = ph  # giữ tham chiếu
-                thumb_lbl = tk.Label(thumb_frame, image=ph, bg="#0F172A")
+                thumb_lbl = tk.Label(thumb_frame, image=ph, bg=LOG_BG)
                 thumb_lbl.pack(expand=True)
                 thumb_loaded = True
             except Exception:
                 pass
 
         if not thumb_loaded:
-            tk.Label(thumb_frame, text="📺", font=(FF, 48), bg="#0F172A", fg="#334155").pack(expand=True)
+            tk.Label(thumb_frame, text="▷", font=(FF, 48), bg=LOG_BG, fg=SIDEBAR_MUTED).pack(expand=True)
 
         # ── Thông tin video ──
         info_frame = tk.Frame(dlg, bg=WHITE, padx=24, pady=16)
@@ -690,11 +977,11 @@ class VideoPlayerDialog:
         st_label, st_color, st_bg = status_info.get(st, ("Không rõ", MUTED, STEP_IDLE))
 
         info_rows = [
-            ("📁 Tên dự án:",  proj["name"]),
-            ("🎙 Ngôn ngữ:",   proj.get("lang_text", "N/A")),
-            ("📊 Trạng thái:", st_label),
-            ("💾 Kích thước:", size_str),
-            ("📂 Đường dẫn:",  str(video_path)),
+            ("Dự án",  proj["name"]),
+            ("Ngôn ngữ",   proj.get("lang_text", "N/A")),
+            ("Trạng thái", st_label),
+            ("Dung lượng", size_str),
+            ("Đường dẫn",  str(video_path)),
         ]
         for label_text, value_text in info_rows:
             row = tk.Frame(info_frame, bg=WHITE)
@@ -713,16 +1000,16 @@ class VideoPlayerDialog:
         btn_frame = tk.Frame(dlg, bg=WHITE, padx=24, pady=16)
         btn_frame.pack(fill="x")
 
-        Btn(btn_frame, "▶  Mở bằng trình phát hệ thống",
+        Btn(btn_frame, "▶  Phát video",
             command=self._open_system_player,
             bg=PRIMARY, padx=16, pady=8).pack(side="left")
 
-        Btn(btn_frame, "📂  Mở thư mục chứa",
+        Btn(btn_frame, "Mở thư mục",
             command=self._open_folder,
-            bg="#475569", padx=16, pady=8).pack(side="left", padx=(10, 0))
+            bg=LOG_BG, padx=16, pady=8).pack(side="left", padx=(10, 0))
 
         if proj["dubbed_video"]:
-            Btn(btn_frame, "⬇  Tải xuống",
+            Btn(btn_frame, "Tải xuống",
                 command=lambda: (dlg.destroy(), self._download_from_dialog()),
                 bg=SUCCESS, padx=16, pady=8).pack(side="left", padx=(10, 0))
 
@@ -779,7 +1066,10 @@ class VideoPlayerDialog:
 # ══════════════════════════════════════════════════════
 
 class NewProjectPage(tk.Frame):
+    """Trang wizard nhập nguồn, chạy ASR, dịch thủ công và khởi động TTS."""
+
     def __init__(self, parent, app):
+        """Khởi tạo trạng thái wizard, hàng đợi log và năm panel giao diện."""
         super().__init__(parent, bg=BG)
         self.app       = app
         self._work_dir = None
@@ -787,170 +1077,257 @@ class NewProjectPage(tk.Frame):
         self._full_json= ""
         self._q        = queue.Queue()
         self._polling  = False
-        self.sub_size_var = tk.StringVar(value="40 (Khuyên dùng)")
+        self._draft_after = None
+        self._loading_translation = False
+        self._draft_last_text = None
+        env = load_env()
+        self.sub_font_var = tk.StringVar(value=env.get("SUBTITLE_FONT") or DEFAULT_FONT)
+        self.sub_size_var = tk.StringVar(value=env.get("SUBTITLE_FONT_SIZE") or str(DEFAULT_SIZE))
+        self.sub_style_vars = {key: tk.StringVar(master=self, value=env.get(key, value))
+                               for key, value in STYLE_DEFAULTS.items()}
+        self._subtitle_custom = False
+        self._subtitle_summary = tk.StringVar()
+        self.sub_font_var.trace_add("write", self._update_subtitle_summary)
+        self.sub_size_var.trace_add("write", self._update_subtitle_summary)
+        for variable in self.sub_style_vars.values():
+            variable.trace_add("write", self._update_subtitle_summary)
+        self._update_subtitle_summary()
         self._build()
 
     def _build(self):
-        hdr = tk.Frame(self, bg=BG, padx=40, pady=20)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="Thiết lập Tiến trình Lồng tiếng", font=FH1, bg=BG, fg=TEXT).pack(side="left")
-        
-        # Thanh tiến trình Wizard
-        sb = tk.Frame(self, bg=BG, padx=40)
-        sb.pack(fill="x", pady=(0, 14))
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x", padx=32, pady=(24, 23))
+        heading(hdr, "PHÒNG LỒNG TIẾNG", "Một video. Một phiên bản mới.",
+                "Đi từng bước để chuyển ngữ và hoàn thiện video của bạn.").pack(side="left")
+        steps = tk.Frame(self, bg=BG)
+        steps.pack(fill="x", padx=32, pady=(0, 18))
         self._slbls = []
-        for i, s in enumerate(STEPS):
-            lbl = tk.Label(sb, text=s, font=FS, bg=STEP_IDLE, fg=MUTED, padx=14, pady=6)
-            lbl.pack(side="left", padx=4)
+        for i, label in enumerate(STEPS):
+            steps.columnconfigure(i, weight=1, uniform="step")
+            block = tk.Frame(steps, bg=BG)
+            block.grid(row=0, column=i, sticky="ew", padx=(0, 5))
+            lbl = tk.Label(block, text=f"{i+1:02d}  {label}", font=(FF, 10), bg=STEP_IDLE,
+                           fg=MUTED, padx=8, pady=11, anchor="w")
+            lbl.pack(fill="x")
             self._slbls.append(lbl)
-            if i < len(STEPS) - 1:
-                tk.Label(sb, text="➔", font=FS, bg=BG, fg=MUTED).pack(side="left", padx=2)
-                
-        flat_sep(self).pack(fill="x", padx=40)
-        
         self._sf = ScrollFrame(self, bg=BG)
-        self._sf.outer.pack(fill="both", expand=True)
+        self._sf.outer.pack(fill="both", expand=True, pady=(0, 8))
         body = self._sf.inner
-        
-        self._p = [
-            self._mk_p1(body),
-            self._mk_p2(body),
-            self._mk_p3(body),
-            self._mk_p4(body),
-            self._mk_p5(body),
-        ]
+        self._p = [self._mk_p1(body), self._mk_p2(body), self._mk_p3(body),
+                   self._mk_p4(body), self._mk_p5(body)]
         self._goto(0)
 
     def _card(self, parent, title=""):
         wrap = tk.Frame(parent, bg=BG)
-        wrap.pack(fill="x", padx=40, pady=8)
+        wrap.pack(fill="x", padx=32, pady=(0, 14))
         frame = tk.Frame(wrap, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
         frame.pack(fill="x")
-        inner = tk.Frame(frame, bg=WHITE, padx=24, pady=18)
+        inner = tk.Frame(frame, bg=WHITE, padx=22, pady=19)
         inner.pack(fill="x")
         if title:
-            tk.Label(inner, text=title, font=FH2, bg=WHITE, fg=TEXT).pack(anchor="w", pady=(0, 12))
+            tk.Label(inner, text=title, font=FH2, bg=WHITE, fg=TEXT,
+                     anchor="w").pack(anchor="w", pady=(0, 14))
         return inner, wrap
 
     def _mk_p1(self, body):
         panel = tk.Frame(body, bg=BG)
-        
-        # 1. URL
-        c, _ = self._card(panel, "Đường dẫn URL Video (YouTube / TikTok / Douyin / Bilibili...)")
-        self.url_var = tk.StringVar()
-        entry_url = tk.Entry(c, textvariable=self.url_var, font=FB, relief="flat", highlightbackground=BORDER, highlightthickness=1, bg=WHITE, fg=TEXT)
-        entry_url.pack(fill="x", ipady=8)
-        
-        # 2. File cục bộ
-        c2, _ = self._card(panel, "Hoặc tải lên tệp tin Video cục bộ")
-        self.file_var = tk.StringVar()
-        fr = tk.Frame(c2, bg=WHITE)
-        fr.pack(fill="x")
-        entry_file = tk.Entry(fr, textvariable=self.file_var, font=FB, relief="flat", highlightbackground=BORDER, highlightthickness=1, bg=WHITE, fg=TEXT)
-        entry_file.pack(side="left", fill="x", expand=True, ipady=7)
-        
-        pick = tk.Label(fr, text=" Chọn file ", font=FS, bg=BG, fg=TEXT, cursor="hand2", padx=12, pady=7, relief="flat", highlightbackground=BORDER, highlightthickness=1)
-        pick.pack(side="right", padx=(10, 0))
-        pick.bind("<Button-1>", lambda e: self._pick_file())
-        
-        # 3. Cấu hình giọng đọc & ngôn ngữ
-        c3, _ = self._card(panel, "Thông số cấu hình lồng tiếng")
-        og = tk.Frame(c3, bg=WHITE)
-        og.pack(fill="x")
-        
+        source, _ = self._card(panel, "Bắt đầu với video của bạn")
+        self.url_var, self.file_var = tk.StringVar(), tk.StringVar()
+        tk.Label(source, text="Dán liên kết video", font=FH3, bg=WHITE, fg=TEXT).pack(anchor="w")
+        tk.Label(source, text="YouTube, TikTok, Douyin, Bilibili và nhiều nền tảng khác.",
+                 font=FS, bg=WHITE, fg=MUTED).pack(anchor="w", pady=(3, 9))
+        entry(source, self.url_var).pack(fill="x")
+        local = tk.Frame(source, bg=WHITE)
+        local.pack(fill="x", pady=(15, 0))
+        tk.Label(local, text="hoặc video từ máy", font=FS, bg=WHITE, fg=MUTED).pack(side="left", padx=(0, 12))
+        entry(local, self.file_var).pack(side="left", fill="x", expand=True)
+        Btn(local, "Chọn video…", command=self._pick_file, bg=SIDEBAR,
+            fg=TEXT, font=FS, padx=14, pady=9).pack(side="left", padx=(10, 0))
+        options, _ = self._card(panel, "Chọn cách video cất lời")
+        saved = load_env()
+        voice_type = saved.get("VOICE_TYPE", "").strip().lower()
         self.target_lang_var = tk.StringVar(value="Tiếng Việt (VI)")
-        self.lang_var        = tk.StringVar(value="zh")
-        self.voice_var       = tk.StringVar(value="male")
-        self.bg_var          = tk.StringVar(value="demucs")
-        self.sub_y_var       = tk.StringVar(value="780")
-        self.sub_size_var    = tk.StringVar(value="40 (Khuyên dùng)")
-        
-        # Ngôn ngữ nguồn
-        tk.Label(og, text="Ngôn ngữ gốc của video", font=FS, bg=WHITE, fg=MUTED).grid(row=0, column=0, padx=(0, 24), sticky="w")
-        ttk.Combobox(og, textvariable=self.lang_var, values=["zh", "en", "ja", "vi", "ko"], state="readonly", width=14).grid(row=1, column=0, padx=(0, 24), sticky="w", pady=(6, 0))
-        
-        # Ngôn ngữ đích
-        tk.Label(og, text="Lồng tiếng dịch sang", font=FS, bg=WHITE, fg=MUTED).grid(row=0, column=1, padx=(0, 24), sticky="w")
-        cb_target = ttk.Combobox(og, textvariable=self.target_lang_var, values=["Tiếng Việt (VI)", "Tiếng Nhật (JP)"], state="readonly", width=18)
-        cb_target.grid(row=1, column=1, padx=(0, 24), sticky="w", pady=(6, 0))
-        cb_target.bind("<<ComboboxSelected>>", self._on_target_lang_change)
-        
-        # Giọng đọc
-        tk.Label(og, text="Giọng đọc (Voice)", font=FS, bg=WHITE, fg=MUTED).grid(row=0, column=2, padx=(0, 24), sticky="w")
-        self.cb_voice = ttk.Combobox(og, textvariable=self.voice_var, values=["male", "female"], state="readonly", width=20)
-        self.cb_voice.grid(row=1, column=2, padx=(0, 24), sticky="w", pady=(6, 0))
-        
-        # Nhạc nền BGM
-        tk.Label(og, text="Xử lý Nhạc nền (BGM)", font=FS, bg=WHITE, fg=MUTED).grid(row=0, column=3, padx=(0, 24), sticky="w")
-        ttk.Combobox(og, textvariable=self.bg_var, values=["demucs", "duck", "none"], state="readonly", width=14).grid(row=1, column=3, padx=(0, 24), sticky="w", pady=(6, 0))
-        
-        # Biến trạng thái ẩn (không hiển thị UI)
+        self.lang_var = tk.StringVar(value="zh")
+        self.voice_var = tk.StringVar(value=default_reference("vi", saved))
+        self.bg_var = tk.StringVar(value="demucs")
+        self.sub_y_var = tk.StringVar(value="780")
+        self._saved_japanese_voice = saved.get("TTS_VOICE", "").strip() or "ja-JP-KeitaNeural"
+        grid = tk.Frame(options, bg=WHITE)
+        grid.pack(fill="x")
+        voice_refs, voice_labels = voice_options("vi", saved)
+        fields = [
+            ("Ngôn ngữ gốc", self.lang_var, ["zh", "en", "ja", "vi", "ko"]),
+            ("Chuyển ngữ sang", self.target_lang_var, ["Tiếng Việt (VI)", "Tiếng Nhật (JP)"]),
+            ("Giọng đọc", self.voice_var, voice_refs),
+            ("Nhạc nền", self.bg_var, ["demucs", "duck", "none"]),
+        ]
+        for i, (label, variable, values) in enumerate(fields):
+            grid.columnconfigure(i, weight=1, uniform="option")
+            cell = tk.Frame(grid, bg=WHITE)
+            cell.grid(row=0, column=i, sticky="ew", padx=(0, 12 if i < 3 else 0))
+            tk.Label(cell, text=label, font=FS, bg=WHITE, fg=MUTED).pack(anchor="w", pady=(0, 7))
+            combo = Choice(cell, textvariable=variable, values=values,
+                                  labels=voice_labels if i == 2 else None,
+                                  state="readonly", width=10, font=FS, style="Studio.TCombobox")
+            combo.pack(fill="x")
+            if i == 1:
+                combo.bind("<<ComboboxSelected>>", self._on_target_lang_change)
+            elif i == 2:
+                self.cb_voice = combo
+        audition = tk.Frame(options, bg=WHITE)
+        audition.pack(fill="x", pady=(12, 0))
+        Btn(audition, "▶  Nghe thử giọng đọc", command=lambda: self.app.open_voice_preview(
+            "vi" if "Việt" in self.target_lang_var.get() else "jp", self.voice_var.get()),
+            bg=PRIMARY_LIGHT, fg=PRIMARY, font=FS, padx=13, pady=8).pack(side="left")
+        self._speed_hint = tk.Label(audition, text="", font=FS, bg=WHITE, fg=MUTED)
+        self._speed_hint.pack(side="left", padx=12)
+        Btn(audition, "＋  Thư viện giọng", command=self.app.open_voice_library,
+            bg=WHITE, fg=TEXT, font=FS, padx=10, pady=8).pack(side="right")
+        flat_sep(options).pack(fill="x", pady=(20, 14))
+        tk.Label(options, text="Làm sạch phụ đề cũ", font=FH3, bg=WHITE, fg=TEXT).pack(anchor="w")
         self.burn_subtitles_var = tk.BooleanVar(value=True)
-        self.ocr_replace_var = tk.BooleanVar(value=False)
-        
-        # Nút Bắt đầu
-        bf = tk.Frame(panel, bg=BG)
-        bf.pack(fill="x", padx=40, pady=(16, 24))
-        Btn(bf, "Khởi chạy quy trình tách tiếng (ASR)", command=self._start_asr).pack(side="left")
-        
-        # Hiệu ứng focus cho entry
-        for e in (entry_url, entry_file):
-            e.bind("<FocusIn>", lambda ev, widget=e: widget.config(highlightbackground=PRIMARY))
-            e.bind("<FocusOut>", lambda ev, widget=e: widget.config(highlightbackground=BORDER))
-            
+        self.ocr_replace_var = tk.BooleanVar(value=True)
+        self.ai_blur_var = tk.BooleanVar(value=False)
+        for label, variable, command in (
+            ("Xóa chữ bằng OCR và đặt phụ đề vào vị trí gốc", self.ocr_replace_var, self._on_ocr_replace_toggle),
+            ("Làm mờ bằng AI (phương án thay thế)", self.ai_blur_var, self._on_ai_blur_toggle),
+        ):
+            tk.Checkbutton(options, text=label, variable=variable, command=command,
+                           font=FB, bg=WHITE, fg=TEXT, activebackground=WHITE,
+                           selectcolor=WHITE, highlightthickness=0, cursor="hand2").pack(anchor="w", pady=(8, 0))
+        tk.Label(options, text="Vùng xử lý OCR: 20–40% tính từ đáy video.",
+                 font=FS, bg=WHITE, fg=MUTED).pack(anchor="w", pady=(8, 0))
+        fonts, _ = self._card(panel, "Phông chữ phụ đề")
+        self._font_shortcut(fonts)
+        actions = tk.Frame(panel, bg=BG)
+        actions.pack(fill="x", padx=32, pady=(2, 20))
+        Btn(actions, "Phân tích video  →", command=self._start_asr, padx=24, pady=11).pack(side="right")
+        tk.Label(actions, text="Tiếp theo: nhận dạng lời nói và tạo bản dịch.", font=FS,
+                 bg=BG, fg=MUTED).pack(side="left", pady=8)
         return panel
 
     def _on_target_lang_change(self, event):
-        target = self.target_lang_var.get()
-        if "Việt" in target:
-            self.cb_voice.config(values=["male", "female"])
-            self.voice_var.set("male")
-        else:
-            self.cb_voice.config(values=["ja-JP-KeitaNeural", "ja-JP-NanamiNeural", "ja-JP-NaokiNeural", "ja-JP-MayuNeural"])
-            self.voice_var.set("ja-JP-KeitaNeural")
+        self._refresh_voice_options(prefer_default=True)
+
+    def _refresh_voice_options(self, prefer_default=False):
+        environment = load_env()
+        language = "vi" if "Việt" in self.target_lang_var.get() else "jp"
+        references, labels = voice_options(language, environment)
+        self.cb_voice.config(values=references, labels=labels)
+        if prefer_default or self.voice_var.get() not in references:
+            self.voice_var.set(default_reference(language, environment))
+
+    def _on_ocr_replace_toggle(self):
+        """Chọn OCR replace thì tắt AI blur để tránh xử lý video hai lần."""
+        if self.ocr_replace_var.get():
+            self.ai_blur_var.set(False)
+
+    def _on_ai_blur_toggle(self):
+        """Chọn AI blur thì tắt OCR replace để chỉ có một nhánh làm sạch ảnh."""
+        if self.ai_blur_var.get():
+            self.ocr_replace_var.set(False)
+
+    def _sync_voice_from_settings(self):
+        """Áp dụng voice mặc định mới lưu cho lần chạy pipeline kế tiếp."""
+        env = load_env()
+        if hasattr(self, "_speed_hint"):
+            self._speed_hint.config(text=f"Tốc độ cơ bản: {env.get('TTS_SPEED') or '1.0'}×")
+        self._refresh_voice_options(prefer_default=True)
+
+    def on_show(self):
+        # Trang có thể vẫn tồn tại trong lúc người dùng sửa Settings.
+        self._sync_voice_from_settings()
+        self._sync_subtitle_from_settings()
+
+    def _update_subtitle_summary(self, *_):
+        background = self.sub_style_vars["SUBTITLE_BG_COLOR"].get()
+        if self.sub_style_vars["SUBTITLE_BG_ENABLED"].get() == "0":
+            background = "Tắt nền"
+        self._subtitle_summary.set(f"{self.sub_font_var.get()} · {self.sub_size_var.get()} px · Nền: {background}")
+
+    def _sync_subtitle_from_settings(self):
+        if self._subtitle_custom:
+            return
+        env = load_env()
+        if self._work_dir:
+            env = load_project_subtitles(self._work_dir, env)
+        self.sub_font_var.set(env.get("SUBTITLE_FONT") or DEFAULT_FONT)
+        self.sub_size_var.set(env.get("SUBTITLE_FONT_SIZE") or str(DEFAULT_SIZE))
+        for key, var in self.sub_style_vars.items():
+            var.set(env.get(key, STYLE_DEFAULTS[key]))
+
+    def _subtitle_settings(self):
+        style = SubtitleStyle.from_settings({key: var.get() for key, var in self.sub_style_vars.items()})
+        return {"SUBTITLE_FONT": get_font(self.sub_font_var.get()).name,
+                "SUBTITLE_FONT_SIZE": str(validate_size(self.sub_size_var.get())), **style.to_settings()}
+
+    def _open_project_subtitles(self):
+        from subtitle_font_ui import SubtitleFontDialog
+        if getattr(self, "_project_font_dialog", None) and self._project_font_dialog.winfo_exists():
+            self._project_font_dialog.lift()
+            return
+        def apply_selection(name, size, style):
+            values = {"SUBTITLE_FONT": name, "SUBTITLE_FONT_SIZE": str(size), **style.to_settings()}
+            if self._work_dir:
+                save_project_subtitles(self._work_dir, values)
+            self._subtitle_custom = True
+            self.sub_font_var.set(name)
+            self.sub_size_var.set(str(size))
+            for key, var in self.sub_style_vars.items():
+                var.set(values[key])
+            return True
+        dialog = self._project_font_dialog = SubtitleFontDialog(self.app, self._subtitle_settings(), apply_selection)
+        dialog.title("Phụ đề của dự án — Auto-Dub Studio")
+        dialog.grab_set()
+
+    def _font_shortcut(self, parent):
+        row = tk.Frame(parent, bg=WHITE)
+        row.pack(fill="x")
+        tk.Label(row, textvariable=self._subtitle_summary, font=FB, bg=WHITE, fg=TEXT).pack(side="left")
+        Btn(row, "Phông, màu & nền phụ đề", command=self._open_project_subtitles,
+            bg=PRIMARY_LIGHT, fg=PRIMARY, font=FS, padx=12, pady=8).pack(side="right")
+
+    def _subtitle_cli_args(self):
+        font = get_font(self.sub_font_var.get())
+        size = validate_size(self.sub_size_var.get())
+        style = SubtitleStyle.from_settings({key: var.get() for key, var in self.sub_style_vars.items()})
+        if self._work_dir:
+            save_project_subtitles(self._work_dir, self._subtitle_settings())
+        return ["--subtitle-font", font.name, "--subtitle-size", str(size), *style.cli_args()]
 
     def _mk_p2(self, body):
+        """Tạo panel log ASR và tùy chọn burn subtitle/cỡ chữ."""
         panel = tk.Frame(body, bg=BG)
-        c, _ = self._card(panel, "Nhật ký quá trình phân tích âm thanh & nhận dạng giọng nói (ASR)")
-        self._asr_log = scrolledtext.ScrolledText(c, font=FM, bg=LOG_BG, fg=LOG_FG, height=18, relief="flat", state="disabled", wrap="word")
+        c, _ = self._card(panel, "Đang lắng nghe video của bạn")
+        self._asr_log = scrolledtext.ScrolledText(c, font=FM, bg=LOG_BG, fg=LOG_FG, height=15, relief="flat", state="disabled", wrap="word", padx=12, pady=10)
         self._asr_log.pack(fill="x")
         self._asr_st = tk.Label(panel, text="", font=FB, bg=BG, fg=MUTED, pady=6)
         self._asr_st.pack()
         
         # Thêm cấu hình vị trí phụ đề vào Bước 2
-        sub_card, _ = self._card(panel, "Cấu hình vị trí & cỡ chữ phụ đề (Có thể thiết lập trong lúc đợi)")
+        sub_card, _ = self._card(panel, "Phụ đề khi xuất video")
         
         cb_burn = tk.Checkbutton(sub_card, text="Vẽ cứng phụ đề lên video (Burn Subtitles)",
-                                 variable=self.burn_subtitles_var, font=FB, bg=WHITE, fg=TEXT, activebackground=WHITE)
+                                 variable=self.burn_subtitles_var, font=FB, bg=WHITE, fg=TEXT,
+                                 activebackground=WHITE, selectcolor=WHITE)
         cb_burn.pack(anchor="w", pady=(10, 0))
         
-        # Vị trí Y đã được tự động hoá hoàn toàn dựa vào toạ độ gốc nên không cần hiển thị nữa.
-        
-        size_frame = tk.Frame(sub_card, bg=WHITE)
-        size_frame.pack(anchor="w", pady=(10, 0))
-        tk.Label(size_frame, text="Cỡ chữ phụ đề (Khuyên dùng):", font=FB, bg=WHITE, fg=TEXT).pack(side="left")
-        self.sub_size_combo = ttk.Combobox(
-            size_frame,
-            textvariable=self.sub_size_var,
-            values=["35 (Nhỏ)", "40 (Khuyên dùng)", "45 (Vừa)", "50 (To)", "55", "60", "65", "70 (Lớn nhất)"],
-            state="readonly",
-            width=16
-        )
-        self.sub_size_combo.pack(side="left", padx=6)
+        self._font_shortcut(sub_card)
         
         # Nút quay lại thiết lập khi có lỗi
-        self.asr_back_btn = Btn(panel, "Quay lại Thiết lập", command=lambda: self._goto(0), bg="#475569")
+        self.asr_back_btn = Btn(panel, "Quay lại Thiết lập", command=lambda: self._goto(0), bg=LOG_BG)
         self.asr_back_btn.pack(pady=10)
         return panel
 
     def _mk_p3(self, body):
+        """Tạo panel xem transcript và nhập JSON dịch thủ công."""
         panel = tk.Frame(body, bg=BG)
         
         # Preview ban đầu
-        c1, _ = self._card(panel, "File dịch thuật gốc (JSON transcript)")
-        pw = tk.Frame(c1, bg="#F8FAFC", highlightbackground=BORDER, highlightthickness=1)
+        c1, _ = self._card(panel, "Lời thoại đã nhận dạng")
+        pw = tk.Frame(c1, bg=BG, highlightbackground=BORDER, highlightthickness=1)
         pw.pack(fill="x")
-        self._json_prev = tk.Label(pw, text="", font=FM, bg="#F8FAFC", fg=TEXT, anchor="nw", justify="left", wraplength=720, padx=12, pady=12)
+        self._json_prev = tk.Label(pw, text="", font=FM, bg=BG, fg=TEXT, anchor="nw", justify="left", wraplength=720, padx=12, pady=12)
         self._json_prev.pack(fill="x")
         
         br = tk.Frame(c1, bg=WHITE)
@@ -959,78 +1336,99 @@ class NewProjectPage(tk.Frame):
         self._copy_ok = tk.Label(br, text="", font=FS, bg=WHITE, fg=SUCCESS)
         self._copy_ok.pack(side="left", padx=12)
         
-        # Paste b
-        c2, _ = self._card(panel, "Dịch thuật (Tuỳ chọn: AI hoặc Thủ công)")
+        # Dịch thủ công để không phát sinh chi phí gọi API dịch.
+        c2, _ = self._card(panel, "Viết bản dịch của bạn")
+        tk.Label(
+            c2,
+            text=(
+                "Hãy giữ nguyên id, text, start, end, duration và điền bản dịch "
+                "vào trường text_vi hoặc text_jp của từng phân đoạn. "
+                "Nên viết ngắn gọn để vừa thời lượng đọc."
+            ),
+            font=FS,
+            bg=WHITE,
+            fg=MUTED,
+            justify="left",
+            wraplength=760,
+        ).pack(anchor="w", pady=(0, 8))
+        self._translation_status = tk.Label(
+            c2,
+            text="Đang chuẩn bị mẫu JSON dịch...",
+            font=FS,
+            bg=WHITE,
+            fg=PRIMARY,
+            anchor="w",
+        )
+        self._translation_status.pack(fill="x", pady=(0, 8))
         
-        gemini_frame = tk.Frame(c2, bg=WHITE)
-        gemini_frame.pack(fill="x", pady=(0, 10))
-        
-        tk.Label(gemini_frame, text="Lựa chọn 1: Dịch tự động bằng AI", font=FB, bg=WHITE, fg="#4338CA").pack(anchor="w")
-        tk.Label(gemini_frame, text="Sử dụng Gemini AI để dịch tự động, kết quả sẽ tự động điền vào ô bên dưới để bạn có thể xem lại trước khi chạy.", font=FS, bg=WHITE, fg=MUTED).pack(anchor="w", pady=(0, 4))
-        self._btn_gemini = Btn(gemini_frame, "🤖 Tự động dịch bằng Gemini AI", command=self._translate_with_gemini, bg="#8B5CF6", fg=WHITE, padx=14, pady=6)
-        self._btn_gemini.pack(anchor="w")
-        
-        tk.Label(c2, text="Lựa chọn 2: Dịch thủ công (Hoặc chỉnh sửa bản dịch AI)", font=FB, bg=WHITE, fg="#4338CA").pack(anchor="w", pady=(10, 4))
-        
-        self._trans_in = scrolledtext.ScrolledText(c2, font=FM, bg="#F8FAFC", fg=TEXT, height=12, relief="flat", wrap="word")
+        self._trans_in = scrolledtext.ScrolledText(c2, font=FM, bg=BG, fg=TEXT, height=14, relief="flat", wrap="word", padx=16, pady=14, insertbackground=PRIMARY, highlightthickness=1, highlightbackground=BORDER, highlightcolor=PRIMARY)
         self._trans_in.pack(fill="x")
-        
-        # Tự động bật Xoá phụ đề gốc bằng AI, không cần hỏi ở giao diện nữa
-        self.ai_blur_var = tk.BooleanVar(value=True)
-        
+        self._trans_in.bind("<<Modified>>", self._translation_changed)
+
+        copy_row = tk.Frame(c2, bg=WHITE)
+        copy_row.pack(fill="x", pady=(10, 0))
+        Btn(copy_row, "Sao chép mẫu JSON dịch", command=self._copy_translation_template, padx=14, pady=6).pack(side="left")
+        Btn(copy_row, "Lịch sử bản dịch", command=self._open_translation_history,
+            bg=WHITE, fg=PRIMARY, font=FS, padx=12, pady=6).pack(side="left", padx=8)
 
         bf = tk.Frame(panel, bg=BG)
         bf.pack(fill="x", padx=40, pady=(16, 24))
-        Btn(bf, "Khởi chạy Tổng hợp giọng nói (TTS) & Render Video", command=self._start_tts).pack(side="left")
+        Btn(bf, "Tạo giọng đọc & xuất video  →", command=self._start_tts).pack(side="left")
         return panel
 
 
 
     def _mk_p4(self, body):
+        """Tạo panel log quá trình TTS và ghép nhạc nền."""
         panel = tk.Frame(body, bg=BG)
-        c, _ = self._card(panel, "Nhật ký quá trình lồng tiếng (TTS) & Mix nhạc nền")
-        self._tts_log = scrolledtext.ScrolledText(c, font=FM, bg=LOG_BG, fg=LOG_FG, height=18, relief="flat", state="disabled", wrap="word")
+        c, _ = self._card(panel, "Đang tạo giọng đọc và hoàn thiện video")
+        self._tts_log = scrolledtext.ScrolledText(c, font=FM, bg=LOG_BG, fg=LOG_FG, height=15, relief="flat", state="disabled", wrap="word", padx=12, pady=10)
         self._tts_log.pack(fill="x")
         self._tts_st = tk.Label(panel, text="", font=FB, bg=BG, fg=MUTED, pady=6)
         self._tts_st.pack()
         
         # Nút quay lại chỉnh sửa dịch thuật
-        self.tts_back_btn = Btn(panel, "Quay lại Dịch thuật", command=lambda: self._goto(2), bg="#475569")
+        self.tts_back_btn = Btn(panel, "Quay lại Dịch thuật", command=lambda: self._goto(2), bg=LOG_BG)
         self.tts_back_btn.pack(pady=10)
         return panel
 
     def _mk_p5(self, body):
         panel = tk.Frame(body, bg=BG)
-        c, _ = self._card(panel, "Video của bạn đã sẵn sàng!")
-        tk.Label(c, text="Quá trình lồng tiếng đã hoàn tất thành công!", font=FH1, bg=WHITE, fg=SUCCESS).pack(pady=(16, 4))
-        
-        self._done_lbl = tk.Label(c, text="", font=FM, bg=WHITE, fg=MUTED, wraplength=700)
-        self._done_lbl.pack(pady=4)
-        
-        br = tk.Frame(c, bg=WHITE, pady=16)
-        br.pack()
-        Btn(br, "Xem video", command=self._play_video, bg="#3b82f6", padx=14).pack(side="left", padx=6)
-        Btn(br, "Tải tệp Video xuống", command=self._download_video, padx=14).pack(side="left", padx=6)
-        Btn(br, "Dự án mới", command=self.app.reset_new, bg="#475569", padx=14).pack(side="left", padx=6)
-        Btn(br, "Về danh sách", command=lambda: self.app._show("projects"), bg=BORDER, fg=TEXT, padx=14).pack(side="left", padx=6)
+        card, _ = self._card(panel)
+        tk.Label(card, text="✓", font=(FF, 42), bg=WHITE, fg=SUCCESS).pack(pady=(18, 12))
+        tk.Label(card, text="Một phiên bản mới đã sẵn sàng.", font=FH1, bg=WHITE, fg=TEXT).pack()
+        tk.Label(card, text="Video đã được lồng tiếng và kết xuất thành công.", font=FB,
+                 bg=WHITE, fg=MUTED).pack(pady=(8, 20))
+        self._done_lbl = tk.Label(card, text="", font=FS, bg=WHITE, fg=MUTED, wraplength=680)
+        self._done_lbl.pack(pady=(0, 16))
+        actions = tk.Frame(card, bg=WHITE)
+        actions.pack(pady=(0, 18))
+        Btn(actions, "▶  Xem video", command=self._play_video, padx=18).pack(side="left", padx=5)
+        Btn(actions, "Tải video xuống", command=self._download_video, bg=SIDEBAR,
+            fg=TEXT, padx=18).pack(side="left", padx=5)
+        more = tk.Frame(card, bg=WHITE)
+        more.pack(pady=(0, 18))
+        Btn(more, "＋  Tạo video khác", command=self.app.reset_new, bg=WHITE,
+            fg=TEXT, font=FS).pack(side="left", padx=5)
+        Btn(more, "Về thư viện", command=lambda: self.app._show("projects"), bg=WHITE,
+            fg=MUTED, font=FS).pack(side="left", padx=5)
         return panel
 
     def _goto(self, step):
-        for p in self._p:
-            p.pack_forget()
+        for panel in self._p:
+            panel.pack_forget()
         self._p[step].pack(fill="x")
         self._sf.reset_scroll()
-        
-        # Cập nhật màu các pill step chỉ số
-        for i, lbl in enumerate(self._slbls):
+        for i, label in enumerate(self._slbls):
             if i < step:
-                lbl.config(bg=SUCCESS_BG, fg=SUCCESS, font=(FF, 9, "bold"))
+                label.config(text=f"✓  {STEPS[i]}", bg=SUCCESS_BG, fg=SUCCESS, font=(FF, 10, "bold"))
             elif i == step:
-                lbl.config(bg=STEP_ACT, fg=PRIMARY, font=(FF, 9, "bold"))
+                label.config(text=f"{i+1:02d}  {STEPS[i]}", bg=PRIMARY_LIGHT, fg=PRIMARY, font=(FF, 10, "bold"))
             else:
-                lbl.config(bg=STEP_IDLE, fg=MUTED, font=FS)
+                label.config(text=f"{i+1:02d}  {STEPS[i]}", bg=STEP_IDLE, fg=MUTED, font=(FF, 10))
 
     def _pick_file(self):
+        """Mở hộp chọn file và đưa đường dẫn video vào form."""
         path = filedialog.askopenfilename(
             title="Chọn video đầu vào",
             filetypes=[("Video File", "*.mp4 *.mkv *.webm *.mov *.avi"), ("All Files", "*.*")])
@@ -1038,9 +1436,15 @@ class NewProjectPage(tk.Frame):
             self.file_var.set(path)
 
     def _start_asr(self):
+        """Khởi chạy pipeline ASR trong thread, đồng thời stream log lên GUI."""
         url    = self.url_var.get().strip()
         fpath  = self.file_var.get().strip()
         target = self.target_lang_var.get()
+        try:
+            subtitle_options = self._subtitle_cli_args()
+        except (ValueError, OSError) as error:
+            messagebox.showerror("Phông phụ đề", str(error))
+            return
         
         if not url and not fpath:
             messagebox.showwarning("Nhập liệu trống", "Vui lòng dán link URL hoặc chọn file video từ máy tính.")
@@ -1048,6 +1452,7 @@ class NewProjectPage(tk.Frame):
             
         script_name = "pipeline_vi.py" if "Việt" in target else "pipeline.py"
         cmd = [PYTHON, str(BASE_DIR / script_name)]
+        cmd += subtitle_options
         
         if url:   cmd += ["--url", url]
         if fpath: cmd += ["--file", fpath]
@@ -1057,11 +1462,11 @@ class NewProjectPage(tk.Frame):
                 "--bg-mode",     self.bg_var.get()]
         if self.burn_subtitles_var.get():
             cmd += ["--burn-subtitles"]
-        if self.ocr_replace_var.get():
+        if "Việt" in target and self.ocr_replace_var.get():
             cmd += ["--ocr-replace"]
             
-        # Luôn bật tính năng AI xoá phụ đề gốc
-        cmd += ["--ai-blur"]
+        if self.ai_blur_var.get():
+            cmd += ["--ai-blur"]
                 
         self._goto(1)
         self._wlog(self._asr_log, f"$ {' '.join(cmd)}\n\n")
@@ -1118,9 +1523,10 @@ class NewProjectPage(tk.Frame):
 
 
     def _start_tts(self):
+        """Kiểm tra JSON dịch, lưu file rồi khởi chạy pipeline resume cho TTS."""
         raw = self._trans_in.get("1.0", "end").strip()
         if not raw:
-            messagebox.showwarning("Thiếu dữ liệu", "Vui lòng nhập mã JSON đã được dịch vào khung văn bản.")
+            messagebox.showwarning("Thiếu dữ liệu", "Vui lòng điền JSON bản dịch thủ công vào khung văn bản.")
             return
             
         try:
@@ -1135,11 +1541,45 @@ class NewProjectPage(tk.Frame):
             
         target = self.target_lang_var.get()
         is_vi = "Việt" in target
+        target_field = "text_vi" if is_vi else "text_jp"
+
+        # Kiểm tra trước khi ghi file/chạy TTS để không tạo audio từ JSON
+        # thiếu câu hoặc sai timeline.
+        source_path = self._work_dir / "transcript_original.json"
+        try:
+            source_items = json.loads(source_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("Lỗi", f"Không đọc được transcript gốc:\n{exc}")
+            return
+        if not isinstance(source_items, list):
+            messagebox.showerror("Lỗi", "transcript_original.json phải là một mảng JSON các phân đoạn.")
+            return
+        from src.translate_pending import has_complete_translation
+        if not has_complete_translation(data, target_field, source_items):
+            messagebox.showwarning(
+                "Bản dịch chưa hoàn tất",
+                (
+                    f"Cần một mảng JSON có đủ {len(source_items) if isinstance(source_items, list) else 'tất cả'} "
+                    f"phân đoạn và trường {target_field} không rỗng ở mọi phân đoạn.\n\n"
+                    "Giữ nguyên id/start/end/duration rồi chỉ điền phần dịch."
+                ),
+            )
+            return
         
+        try:
+            subtitle_options = self._subtitle_cli_args()
+        except (ValueError, OSError) as error:
+            messagebox.showerror("Phông phụ đề", str(error))
+            return
+
         # Ghi file dịch
         trans_file_name = "transcript_vi.json" if is_vi else "transcript_jp.json"
         vi_path = self._work_dir / trans_file_name
         vi_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        store = Store()
+        project_id = store.sync_project(self._work_dir, "vi" if is_vi else "jp")
+        store.save_draft(project_id, raw, "vi" if is_vi else "jp", origin="tts-submit", dirty=False)
+        self._draft_last_text = self._trans_in.get("1.0", "end-1c")
         
         # Tìm video nguồn
         src = self.file_var.get().strip()
@@ -1155,12 +1595,10 @@ class NewProjectPage(tk.Frame):
             cmd += ["--file", src]
         if self.burn_subtitles_var.get():
             cmd += ["--burn-subtitles"]
-        if self.ocr_replace_var.get():
+        if is_vi and self.ocr_replace_var.get():
             cmd += ["--ocr-replace"]
         cmd += ["--subtitle-y", self.sub_y_var.get()]
-        # Trích xuất số cỡ chữ từ chuỗi (ví dụ "38 (Rất to)" -> "38")
-        sub_size_str = self.sub_size_var.get().split()[0]
-        cmd += ["--subtitle-size", sub_size_str]
+        cmd += subtitle_options
         # Truyền cờ AI blur nếu được bật
         if self.ai_blur_var.get():
             cmd += ["--ai-blur"]
@@ -1239,7 +1677,7 @@ class NewProjectPage(tk.Frame):
                  font=FB, bg=PRIMARY, fg=WHITE).pack(anchor="w")
 
         canvas = tk.Canvas(dialog, width=disp_w, height=disp_h,
-                           highlightthickness=0, cursor="sb_v_double_arrow", bg="#0F172A")
+                           highlightthickness=0, cursor="sb_v_double_arrow", bg=LOG_BG)
         canvas.pack()
 
         # Chọn frame ngẫu nhiên ban đầu từ 5% đến 95%
@@ -1263,7 +1701,7 @@ class NewProjectPage(tk.Frame):
         drag = {"y0": None, "y1": None}
 
         status_var = tk.StringVar(value="— Kéo chuột để vẽ dải ngang chọn vị trí phụ đề —")
-        status_lbl = tk.Label(dialog, textvariable=status_var, font=FB, bg=WHITE, fg="#4338CA", pady=8)
+        status_lbl = tk.Label(dialog, textvariable=status_var, font=FB, bg=WHITE, fg=PRIMARY, pady=8)
         status_lbl.pack(fill="x", padx=20)
 
         def _to_orig_y(dy): return int(dy / scale)
@@ -1377,8 +1815,8 @@ class NewProjectPage(tk.Frame):
             load_and_render_frame()
 
         Btn(ft, "✓  Xác nhận & Lưu vị trí", command=save_and_close, bg=PRIMARY, padx=16, pady=8).pack(side="left")
-        Btn(ft, "🔄  Đổi ảnh ngẫu nhiên khác", command=randomize_frame, bg="#2563EB", fg=WHITE, padx=12, pady=8).pack(side="left", padx=(10, 0))
-        Btn(ft, "Hủy bộ", command=dialog.destroy, bg="#e2e8f0", fg=TEXT, padx=14, pady=8).pack(side="right")
+        Btn(ft, "↻  Đổi khung hình", command=randomize_frame, bg=PRIMARY, fg=WHITE, padx=12, pady=8).pack(side="left", padx=(10, 0))
+        Btn(ft, "Hủy", command=dialog.destroy, bg=SIDEBAR, fg=TEXT, padx=14, pady=8).pack(side="right")
 
         load_and_render_frame()
 
@@ -1390,11 +1828,13 @@ class NewProjectPage(tk.Frame):
         dialog.geometry(f"+{(sw - dw) // 2}+{(sh - dh) // 2}")
 
     def _start_poll(self):
+        """Bắt đầu vòng polling hàng đợi log nếu chưa chạy."""
         if not self._polling:
             self._polling = True
             self._poll()
 
     def _poll(self):
+        """Đọc sự kiện từ worker và cập nhật log/trạng thái trên main thread."""
         stop = False
         try:
             while True:
@@ -1403,6 +1843,7 @@ class NewProjectPage(tk.Frame):
                 elif tag == "log_tts":  self._wlog(self._tts_log, data)
                 elif tag == "asr_done":
                     self._work_dir = data
+                    save_project_subtitles(self._work_dir, self._subtitle_settings())
                     self._asr_st.config(text="ASR nhận diện hoàn tất!", fg=SUCCESS)
                     self._prep_translate()
                     stop = True
@@ -1427,6 +1868,7 @@ class NewProjectPage(tk.Frame):
     def _prep_translate(self):
         """Đọc file JSON gốc, điền vào ô hiển thị, rồi chuyển sang Bước 3 (Dịch thuật)."""
         orig = self._work_dir / "transcript_original.json" if self._work_dir else None
+        items = []
         if orig and orig.exists():
             try:
                 items = json.loads(orig.read_text(encoding="utf-8"))
@@ -1442,37 +1884,125 @@ class NewProjectPage(tk.Frame):
             self._full_json = ""
             self._json_prev.config(text="Không tìm thấy file kết quả transcript_original.json")
 
-        # Tự động tải bản dịch đã có (nếu có) vào ô nhập liệu
+        self._loading_translation = True
+        # Tải bản dịch đã có (nếu có) và ghép vào mẫu. Nếu chưa có, tạo mẫu
+        # với trường đích rỗng để người dùng tự dịch ngay trên desktop.
         self._trans_in.delete("1.0", "end")
         target = self.target_lang_var.get()
         is_vi = "Việt" in target
+        target_field = "text_vi" if is_vi else "text_jp"
         trans_file_name = "transcript_vi.json" if is_vi else "transcript_jp.json"
         trans_path = self._work_dir / trans_file_name if self._work_dir else None
+        from src.translate_pending import build_translation_template, has_complete_translation
+        template_items = build_translation_template(items, target_field) if isinstance(items, list) else []
+        existing_items = None
         if trans_path and trans_path.exists():
             try:
-                trans_items = json.loads(trans_path.read_text(encoding="utf-8"))
-                trans_json_str = json.dumps(trans_items, ensure_ascii=False, indent=2)
-                self._trans_in.insert("1.0", trans_json_str)
-            except Exception:
-                pass
-        # Đảm bảo giọng đọc khớp ngôn ngữ đích
-        if "Việt" in target:
-            if self.voice_var.get() not in ["male", "female"]:
-                self.voice_var.set("male")
-        else:
-            if not self.voice_var.get().startswith("ja-JP"):
-                self.voice_var.set("ja-JP-KeitaNeural")
+                existing_items = json.loads(trans_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_items = None
 
-        # Tự động dịch và tiếp tục sang bước TTS lồng tiếng tự động
-        self._goto(2)
-        if not (trans_path and trans_path.exists()):
-            self._translate_with_gemini(auto_start_tts=True)
+        if isinstance(existing_items, list) and isinstance(items, list):
+            existing_by_id = {
+                item.get("id"): item
+                for item in existing_items
+                if isinstance(item, dict) and item.get("id") is not None
+            }
+            for item in template_items:
+                saved = existing_by_id.get(item.get("id"))
+                if isinstance(saved, dict) and isinstance(saved.get(target_field), str):
+                    item[target_field] = saved[target_field]
+
+        if template_items:
+            self._trans_in.insert(
+                "1.0", json.dumps(template_items, ensure_ascii=False, indent=2)
+            )
+            is_complete = has_complete_translation(existing_items, target_field, items)
+            if is_complete:
+                self._translation_status.config(
+                    text="Đã nạp bản dịch đã lưu. Bạn có thể rà soát/chỉnh sửa rồi chạy TTS.",
+                    fg=SUCCESS,
+                )
+            else:
+                self._translation_status.config(
+                    text=(
+                        "Mẫu đã sẵn sàng. Hãy tự dịch tất cả trường "
+                        f"{target_field}; hệ thống không gọi API dịch."
+                    ),
+                    fg=PRIMARY,
+                )
         else:
-            self._start_tts()
+            self._translation_status.config(
+                text="Không tạo được mẫu dịch vì transcript gốc không phải mảng JSON.",
+                fg=DANGER,
+            )
+        if self._work_dir:
+            language = "vi" if is_vi else "jp"
+            store = Store()
+            project_id = store.sync_project(self._work_dir, language)
+            draft = store.draft(project_id)
+            if draft and draft["dirty"]:
+                self._trans_in.delete("1.0", "end")
+                self._trans_in.insert("1.0", draft["content"])
+                self._translation_status.config(text="Đã khôi phục bản nháp từ SQLite. Rà soát rồi chạy TTS khi bản dịch hoàn tất.", fg=SUCCESS)
+        self._trans_in.edit_modified(False)
+        self._draft_last_text = self._trans_in.get("1.0", "end-1c")
+        self._loading_translation = False
+        self._refresh_voice_options()
+
+        # Luôn dừng ở bước dịch để người dùng tự hoàn thiện nội dung.
+        self._goto(2)
+
+    def _translation_changed(self, _event=None):
+        if not self._trans_in.edit_modified():
+            return
+        self._trans_in.edit_modified(False)
+        if self._loading_translation or not self._work_dir:
+            return
+        if self._draft_after is not None:
+            self.after_cancel(self._draft_after)
+        self._draft_after = self.after(900, self.flush_translation_draft)
+
+    def flush_translation_draft(self, origin="editor"):
+        if self._draft_after is not None:
+            self.after_cancel(self._draft_after)
+            self._draft_after = None
+        if not self._work_dir or not hasattr(self, "_trans_in"):
+            return
+        content = self._trans_in.get("1.0", "end-1c")
+        if content == self._draft_last_text:
+            return
+        language = "vi" if "Việt" in self.target_lang_var.get() else "jp"
+        store = Store()
+        project_id = store.sync_project(self._work_dir, language)
+        valid = store.save_draft(project_id, content, language, origin=origin)
+        self._draft_last_text = content
+        self._translation_status.config(text="Đã tự lưu bản dịch vào SQLite." if valid else
+            "Đã tự lưu bản nháp vào SQLite; hoàn thiện JSON và các câu dịch trước khi chạy TTS.", fg=SUCCESS if valid else MUTED)
+
+    def _open_translation_history(self):
+        if not self._work_dir:
+            return
+        self.flush_translation_draft()
+        language = "vi" if "Việt" in self.target_lang_var.get() else "jp"
+        project_id = Store().sync_project(self._work_dir, language)
+        from storage_ui import TranslationHistoryDialog
+        def restore(content):
+            self.flush_translation_draft()
+            self._trans_in.delete("1.0", "end")
+            self._trans_in.insert("1.0", content)
+            self.flush_translation_draft(origin="restore")
+        TranslationHistoryDialog(self, project_id, restore)
+
+    def destroy(self):
+        self.flush_translation_draft()
+        super().destroy()
 
     def load_project(self, proj):
         """Tải dữ liệu từ dự án chưa hoàn thành để tiếp tục từ bước dịch thuật."""
         self._work_dir = proj["path"]
+        self._subtitle_custom = False
+        self._sync_subtitle_from_settings()
         # Đặt ngôn ngữ đích đúng
         if proj["lang"] == "VI":
             self.target_lang_var.set("Tiếng Việt (VI)")
@@ -1482,6 +2012,7 @@ class NewProjectPage(tk.Frame):
         self._prep_translate()
 
     def _copy_json(self):
+        """Sao chép transcript gốc đang hiển thị vào clipboard."""
         if not self._full_json:
             messagebox.showwarning("Trống dữ liệu", "Không tìm thấy nội dung JSON nguồn.")
             return
@@ -1490,46 +2021,19 @@ class NewProjectPage(tk.Frame):
         self._copy_ok.config(text="Đã sao chép vào Clipboard!")
         self.after(2000, lambda: self._copy_ok.config(text=""))
 
-    def _translate_with_gemini(self, auto_start_tts=False):
-        if not self._full_json:
-            messagebox.showwarning("Trống dữ liệu", "Không tìm thấy nội dung JSON nguồn.")
+    def _copy_translation_template(self):
+        """Sao chép mẫu JSON dịch hiện tại vào clipboard."""
+        raw = self._trans_in.get("1.0", "end").strip()
+        if not raw:
+            messagebox.showwarning("Trống dữ liệu", "Chưa có mẫu JSON dịch để sao chép.")
             return
-            
-        target = self.target_lang_var.get()
-        target_lang = "Vietnamese" if "Việt" in target else "Japanese"
-        
-        self._btn_gemini.config(text="Đang dịch... (Vui lòng đợi)", state="disabled", bg="#9CA3AF")
-        
-        def _run_translation():
-            try:
-                from src.translator import translate_json_openai
-                translated_json = translate_json_openai(self._full_json, target_lang)
-                
-                # Update UI in main thread
-                def _update_ui():
-                    self._trans_in.delete("1.0", "end")
-                    self._trans_in.insert("1.0", translated_json)
-                    self._btn_gemini.config(text="🤖 Tự động dịch bằng OpenAI AI", state="normal", bg="#8B5CF6")
-                    if auto_start_tts:
-                        self._start_tts()
-                    else:
-                        messagebox.showinfo("Thành công", "Đã dịch xong bằng OpenAI AI!")
-                    
-                self.after(0, _update_ui)
-                
-            except Exception as e:
-                err_msg = str(e)
-                def _show_err():
-                    self._btn_gemini.config(text="🤖 Tự động dịch bằng OpenAI AI", state="normal", bg="#8B5CF6")
-                    if auto_start_tts:
-                        messagebox.showerror("Lỗi dịch AI", f"Không thể tự động dịch bằng OpenAI. Vui lòng thử lại hoặc dịch thủ công:\n\n{err_msg}")
-                    else:
-                        messagebox.showerror("Lỗi dịch AI", f"Không thể dịch bằng OpenAI:\n\n{err_msg}")
-                self.after(0, _show_err)
-
-        threading.Thread(target=_run_translation, daemon=True).start()
+        self.clipboard_clear()
+        self.clipboard_append(raw)
+        self._copy_ok.config(text="Đã sao chép mẫu dịch vào Clipboard!")
+        self.after(2000, lambda: self._copy_ok.config(text=""))
 
     def _go_done(self):
+        """Hiển thị file đầu ra, tạo thumbnail và chuyển wizard sang Hoàn tất."""
         self._done_lbl.config(text=str(self._dubbed) if self._dubbed else "")
         if self._work_dir and self._dubbed:
             thumb = self._work_dir / "thumbnail.jpg"
@@ -1544,6 +2048,7 @@ class NewProjectPage(tk.Frame):
             pass
 
     def _play_video(self):
+        """Mở video kết quả bằng trình phát mặc định trên macOS."""
         if not self._dubbed or not self._dubbed.exists():
             messagebox.showerror("Lỗi", "Không tìm thấy video đích đã xử lý.")
             return
@@ -1553,6 +2058,7 @@ class NewProjectPage(tk.Frame):
             messagebox.showerror("Lỗi", f"Không thể mở video:\n{e}")
 
     def _download_video(self):
+        """Sao chép video kết quả tới thư mục do người dùng chọn."""
         if not self._dubbed or not self._dubbed.exists():
             messagebox.showerror("Lỗi", "Không tìm thấy video đích đã xử lý.")
             return
@@ -1579,21 +2085,25 @@ class NewProjectPage(tk.Frame):
 # ══════════════════════════════════════════════════════
 
 class SettingsPage(tk.Frame):
+    """Trang chỉnh sửa API, voice và các tham số dùng chung của pipeline."""
+
     _GROUPS = [
         ("Azure Speech API (Cần thiết cho ASR & TTS tiếng Nhật)", [
             ("AZURE_SPEECH_KEY",    "Speech API Key",  True),
             ("AZURE_SPEECH_REGION", "Region của dịch vụ", False),
+            ("TTS_VOICE",           "Tên giọng Nhật Azure (ja-JP-...)", False),
         ]),
         ("LucyLab API — Tiếng Việt (Chỉ dùng nếu lồng tiếng Việt)", [
             ("VIETNAMESE_API_KEY",        "LucyLab API Key", True),
+            ("VIETNAMESE_API_KEY_2",      "LucyLab API Key dự phòng #2", True),
+            ("VIETNAMESE_API_KEY_3",      "LucyLab API Key dự phòng #3", True),
+            ("VIETNAMESE_API_KEY_4",      "LucyLab API Key dự phòng #4", True),
+            ("VIETNAMESE_API_KEY_5",      "LucyLab API Key dự phòng #5", True),
             ("VIETNAMESE_VOICEID_MALE",   "Mã giọng Nam (Male Voice ID)", False),
             ("VIETNAMESE_VOICEID_FEMALE", "Mã giọng Nữ (Female Voice ID)", False),
             ("LUCYLAB_API_URL",           "Đường dẫn LucyLab API URL", False),
-            ("VIETNAMESE_TTS_MAX_SPEED",  "Tốc độ tối đa của TTS Việt", False),
-        ]),
-        ("OpenAI API (Dùng dịch thuật tự động)", [
-            ("OPENAI_API_KEY", "OpenAI API Key", True),
-            ("OPENAI_MODEL_ID", "Model OpenAI (vd: gpt-4o-mini)", False),
+            ("AZURE_VI_TTS_VOICE",        "Giọng Việt Azure dự phòng (vi-VN-...)", False),
+            ("VOICE_TYPE",                "Giọng mặc định Việt (male/female)", False),
         ]),
         ("Google Gemini API (Tuỳ chọn — Tạo mô tả & ảnh thu nhỏ)", [
             ("GOOGLE_API_KEY", "Gemini API Key", True),
@@ -1604,73 +2114,133 @@ class SettingsPage(tk.Frame):
         ("Cấu hình xử lý tệp & thông số chung", [
             ("DEFAULT_SOURCE_LANG", "Mã ngôn ngữ nguồn mặc định", False),
             ("AUDIO_SAMPLE_RATE",   "Tần số lấy mẫu âm thanh (Hz)", False),
-            ("AUDIO_SLOW_FACTOR",   "Tỉ lệ kéo dài/làm chậm âm thanh gốc", False),
-            ("TTS_VOICE",           "Tên giọng đọc tiếng Nhật mặc định", False),
-            ("TTS_MAX_SPEED_RATIO", "Giới hạn tốc độ tăng tối đa", False),
+            ("TTS_SPEED",          "Tốc độ đọc cơ bản (0.5× – 2.0×)", False),
+            ("TTS_OVERFLOW_MAX_SPEED", "Tốc độ tối đa khi câu dài (0.5× – 2.0×)", False),
             ("OUTPUT_DIR",          "Thư mục chứa đầu ra mặc định", False),
         ]),
+        ("Phông chữ phụ đề", []),
     ]
 
     def __init__(self, parent, app):
+        """Tải cấu hình hiện tại và dựng form chỉnh sửa .env."""
         super().__init__(parent, bg=BG)
         self.app   = app
         self._vars = {}
+        self._loading = True
+        self._autosave_after = None
+        self._status_after = None
+        self._dirty = False
         self._build()
+        self._loading = False
 
     def _build(self):
-        hdr = tk.Frame(self, bg=BG, padx=40, pady=24)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="Cấu hình hệ thống (.env)", font=FH1, bg=BG, fg=TEXT).pack(side="left")
-        Btn(hdr, "Lưu cấu hình", command=self._save, bg=PRIMARY).pack(side="right")
-        
-        flat_sep(self).pack(fill="x", padx=40)
-        
-        sf = ScrollFrame(self, bg=BG)
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x", padx=32, pady=(24, 23))
+        heading(hdr, "CÀI ĐẶT STUDIO", "Thiết lập một lần. Sáng tạo mỗi ngày.",
+                "Kết nối dịch vụ và chọn cấu hình phù hợp với bạn.").pack(anchor="w")
+        actions = tk.Frame(self, bg=BG)
+        actions.pack(fill="x", padx=32, pady=(0, 14))
+        Btn(actions, "＋  Thư viện giọng đọc", command=self.app.open_voice_library,
+            bg=PRIMARY_LIGHT, fg=PRIMARY, font=FS, padx=13, pady=7).pack(side="left")
+        Btn(actions, "Dữ liệu SQLite & sao lưu", command=self.app.open_database,
+            bg=WHITE, fg=TEXT, font=FS, padx=13, pady=7).pack(side="left", padx=8)
+        tabs = tk.Frame(self, bg=BG)
+        tabs.pack(fill="x", padx=32, pady=(0, 18))
+        self._group_buttons, self._group_panels = [], []
+        names = ["Azure Speech", "Giọng Việt · LucyLab", "Gemini AI", "Xử lý video", "Phông phụ đề"]
+        descriptions = [
+            ("Nhận dạng lời nói & giọng Nhật", "Kết nối Azure để nhận dạng lời thoại và tổng hợp giọng tiếng Nhật."),
+            ("Giọng đọc tiếng Việt", "Chọn giọng LucyLab, khóa dự phòng và giọng Azure thay thế."),
+            ("Nội dung & hình ảnh", "Gemini hỗ trợ tạo tiêu đề, mô tả và ảnh thu nhỏ cho video."),
+            ("Tùy chỉnh quy trình", "Điều chỉnh âm thanh, ngôn ngữ mặc định và vị trí lưu kết quả."),
+            ("Phông chữ cho video của bạn", "Chọn kiểu chữ, cỡ phụ đề và xem trước ngay tại đây."),
+        ]
+        for i, name in enumerate(names):
+            tabs.columnconfigure(i, weight=1, uniform="settings_tab")
+            button = Btn(tabs, name, command=lambda index=i: self._select_group(index),
+                         bg=TEXT if i == 0 else BG, fg=WHITE if i == 0 else MUTED,
+                         font=FS, padx=15, pady=9)
+            button.grid(row=0, column=i, sticky="ew", padx=(0, 6))
+            self._group_buttons.append(button)
+        self._settings_sf = sf = ScrollFrame(self, bg=BG)
         sf.outer.pack(fill="both", expand=True)
-        body = sf.inner
-        
-        env  = load_env()
-        for gname, fields in self._GROUPS:
-            wrap = tk.Frame(body, bg=BG)
-            wrap.pack(fill="x", padx=40, pady=8)
-            card = tk.Frame(wrap, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x")
-            inner = tk.Frame(card, bg=WHITE, padx=24, pady=18)
-            inner.pack(fill="x")
-            
-            tk.Label(inner, text=gname, font=FH2, bg=WHITE, fg=TEXT).pack(anchor="w", pady=(0, 14))
-            for key, label, secret in fields:
-                row = tk.Frame(inner, bg=WHITE)
-                row.pack(fill="x", pady=6)
-                tk.Label(row, text=label, font=FB, bg=WHITE, fg=MUTED, width=32, anchor="w").pack(side="left")
-                
-                var = tk.StringVar(value=env.get(key, ""))
-                self._vars[key] = var
-                
-                entry = tk.Entry(row, textvariable=var, font=FB, relief="flat", highlightbackground=BORDER, highlightthickness=1, bg=WHITE, fg=TEXT)
-                entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(8, 0))
-                
-                # Hiệu ứng focus viền entry
-                entry.bind("<FocusIn>", lambda ev, widget=entry: widget.config(highlightbackground=PRIMARY))
-                entry.bind("<FocusOut>", lambda ev, widget=entry: widget.config(highlightbackground=BORDER))
-                
+        env = load_env()
+        for index, (_, fields) in enumerate(self._GROUPS):
+            panel = tk.Frame(sf.inner, bg=BG)
+            self._group_panels.append(panel)
+            card = tk.Frame(panel, bg=WHITE, highlightbackground=BORDER,
+                            highlightthickness=1, padx=24, pady=22)
+            card.pack(fill="x", padx=32, pady=(0, 18))
+            title, description = descriptions[index]
+            tk.Label(card, text=title, font=FH2, bg=WHITE, fg=TEXT).pack(anchor="w")
+            tk.Label(card, text=description, font=FS, bg=WHITE, fg=MUTED,
+                     wraplength=730, justify="left").pack(anchor="w", pady=(6, 19))
+            flat_sep(card).pack(fill="x", pady=(0, 15))
+            if index == 4:
+                from subtitle_font_ui import SubtitleFontPanel
+                for key, default in SUBTITLE_DEFAULTS.items():
+                    variable = tk.StringVar(value=env.get(key) or default)
+                    self._vars[key] = variable
+                    variable.trace_add("write", self._on_setting_changed)
+                self._font_panel = SubtitleFontPanel(card, self._vars["SUBTITLE_FONT"], self._vars["SUBTITLE_FONT_SIZE"],
+                    style_vars={key: self._vars[key] for key in STYLE_DEFAULTS})
+                self._font_panel.pack(fill="x")
+            grid = tk.Frame(card, bg=WHITE)
+            grid.pack(fill="x")
+            for column in range(2):
+                grid.columnconfigure(column, weight=1, uniform="setting")
+            for i, (key, label, secret) in enumerate(fields):
+                cell = tk.Frame(grid, bg=WHITE)
+                cell.grid(row=i // 2, column=i % 2, sticky="ew", padx=(0, 18) if i % 2 == 0 else (0, 0), pady=(0, 18))
+                tk.Label(cell, text=label, font=FS, bg=WHITE, fg=MUTED,
+                         anchor="w").pack(anchor="w", pady=(0, 7))
+                row = tk.Frame(cell, bg=WHITE)
+                row.pack(fill="x")
+                default = {"TTS_SPEED": "1.0", "TTS_OVERFLOW_MAX_SPEED": "1.4"}.get(key, "")
+                variable = tk.StringVar(value=env.get(key) or default)
+                self._vars[key] = variable
+                variable.trace_add("write", self._on_setting_changed)
+                field = entry(row, variable, secret=secret)
+                field.config(width=12)
+                field.pack(side="left", fill="x", expand=True)
+                field.bind("<FocusOut>", lambda e: self.flush_autosave(), add="+")
                 if secret:
-                    entry.config(show="*")
-                    sv = tk.BooleanVar(value=False)
-                    def _toggle(e=entry, s=sv):
-                        s.set(not s.get())
-                        e.config(show="" if s.get() else "*")
-                    tog = tk.Label(row, text="Hiện", font=FS, bg=WHITE, fg=PRIMARY, cursor="hand2", padx=10)
-                    tog.pack(side="left")
-                    tog.bind("<Button-1>", lambda ev, t=_toggle: t())
-                    
-        bot = tk.Frame(body, bg=BG)
-        bot.pack(fill="x", padx=40, pady=(16, 24))
-        Btn(bot, "Lưu cấu hình (.env)", command=self._save, padx=20, pady=10).pack(side="left")
-        self._saved_lbl = tk.Label(bot, text="", font=FB, bg=BG, fg=SUCCESS)
-        self._saved_lbl.pack(side="left", padx=14)
+                    toggle = Btn(row, "Hiện", bg=WHITE, fg=PRIMARY, font=(FF, 9), padx=8, pady=10)
+                    toggle.pack(side="left", padx=(5, 0))
+                    def show_secret(widget=field, button=toggle):
+                        hidden = bool(widget.cget("show"))
+                        widget.config(show="" if hidden else "•")
+                        button.config(text="Ẩn" if hidden else "Hiện")
+                    toggle.config(command=show_secret)
+            if index in (0, 1):
+                Btn(card, "▶  Nghe thử giọng Nhật" if index == 0 else "▶  Nghe thử giọng Việt",
+                    command=lambda lang="jp" if index == 0 else "vi": self.app.open_voice_preview(lang),
+                    bg=PRIMARY_LIGHT, fg=PRIMARY, font=FS, padx=14).pack(anchor="w", pady=(2, 0))
+            elif index == 3:
+                tk.Label(card, text=("1.0× là tốc độ tự nhiên. Câu dài chỉ tăng đến mức tối đa; "
+                         "nếu vẫn dư thì chồng lời tại mốc gốc. Nếu mức tối đa thấp hơn tốc độ cơ bản, "
+                         "hệ thống giữ tốc độ cơ bản. Bản dịch và mốc phụ đề được giữ nguyên."),
+                         font=FS, bg=WHITE, fg=MUTED, wraplength=710, justify="left").pack(anchor="w")
+        footer = tk.Frame(self, bg=BG)
+        footer.pack(fill="x", padx=32, pady=(12, 20))
+        flat_sep(footer).pack(fill="x", pady=(0, 12))
+        Btn(footer, "Lưu thay đổi", command=self._save, padx=22).pack(side="right")
+        tk.Label(footer, text="●  Tự động lưu khi bạn ngừng nhập", font=FS,
+                 bg=BG, fg=MUTED).pack(side="left")
+        self._saved_lbl = tk.Label(footer, text="", font=FS, bg=BG, fg=SUCCESS)
+        self._saved_lbl.pack(side="left", padx=15)
+        self._select_group(0)
+
+    def _select_group(self, index):
+        for i, panel in enumerate(self._group_panels):
+            panel.pack_forget()
+            self._group_buttons[i].config(bg=TEXT if i == index else BG,
+                                          fg=WHITE if i == index else MUTED)
+        self._group_panels[index].pack(fill="x")
+        self._settings_sf.reset_scroll()
 
     def _test_gemini(self):
+        """Gửi một prompt nhỏ để kiểm tra Gemini với key đang nhập."""
         api_key = self._vars.get("GOOGLE_API_KEY").get().strip()
         if not api_key:
             messagebox.showerror("Lỗi", "Vui lòng nhập Gemini API Key vào ô trống trước khi thử kết nối.")
@@ -1715,16 +2285,77 @@ class SettingsPage(tk.Frame):
         import threading
         threading.Thread(target=_run_test, daemon=True).start()
 
-    def _save(self):
-        data = {k: v.get().strip() for k, v in self._vars.items() if v.get().strip()}
+    def _on_setting_changed(self, *_args):
+        """Debounce việc ghi để gõ API key không ghi lại .env sau từng ký tự."""
+        if self._loading:
+            return
+        self._dirty = True
+        if self._autosave_after is not None:
+            try:
+                self.after_cancel(self._autosave_after)
+            except tk.TclError:
+                pass
+        self._saved_lbl.config(text="Đang chờ lưu thay đổi...", fg=WARN)
+        self._autosave_after = self.after(650, lambda: self._save(automatic=True))
+
+    def _save(self, automatic: bool = False):
+        """Persist every visible setting, including an intentional blank value."""
+        if self._autosave_after is not None:
+            try:
+                self.after_cancel(self._autosave_after)
+            except tk.TclError:
+                pass
+            self._autosave_after = None
+
+        # Ghi cả giá trị rỗng để khi thay/xóa API key, file .env thật sự được
+        # cập nhật thay vì âm thầm giữ lại key cũ.
+        data = {k: v.get().strip() for k, v in self._vars.items()}
+        from src.tts_speed import validate_speed
+        try:
+            for key in ("TTS_SPEED", "TTS_OVERFLOW_MAX_SPEED"):
+                data[key] = f"{validate_speed(data[key]):g}"
+            data["SUBTITLE_FONT"] = get_font(data["SUBTITLE_FONT"]).name
+            data["SUBTITLE_FONT_SIZE"] = str(validate_size(data["SUBTITLE_FONT_SIZE"]))
+            data.update(SubtitleStyle.from_settings(data).to_settings())
+        except (ValueError, OSError) as error:
+            self._saved_lbl.config(text=str(error), fg=DANGER)
+            return False
         save_env(data)
-        self._saved_lbl.config(text="Đã cập nhật tệp tin cấu hình!")
-        self.after(2000, lambda: self._saved_lbl.config(text=""))
+        self._dirty = False
+
+        status = "Đã tự động lưu vào .env" if automatic else "Đã cập nhật tệp tin cấu hình!"
+        self._saved_lbl.config(text=status, fg=SUCCESS)
+        if self._status_after is not None:
+            try:
+                self.after_cancel(self._status_after)
+            except tk.TclError:
+                pass
+        self._status_after = self.after(2500, lambda: self._saved_lbl.config(text=""))
+
+        # Cập nhật voice đang hiển thị trên trang tạo dự án đã được khởi tạo.
+        new_page = self.app._pages.get("new")
+        if new_page and hasattr(new_page, "_sync_voice_from_settings"):
+            new_page._sync_voice_from_settings()
+            new_page._sync_subtitle_from_settings()
+        return True
+
+    def flush_autosave(self):
+        """Ghi ngay các thay đổi còn chờ khi người dùng rời trang Settings."""
+        if getattr(self, "_dirty", False):
+            return self._save(automatic=True)
+        return True
 
     def on_show(self):
+        """Nạp lại giá trị .env khi người dùng mở lại trang Settings."""
         env = load_env()
-        for k, v in self._vars.items():
-            v.set(env.get(k, ""))
+        self._loading = True
+        try:
+            for k, v in self._vars.items():
+                default = {"TTS_SPEED": "1.0", "TTS_OVERFLOW_MAX_SPEED": "1.4",
+                           **SUBTITLE_DEFAULTS}.get(k, "")
+                v.set(env.get(k) or default)
+        finally:
+            self._loading = False
 
 
 if __name__ == "__main__":

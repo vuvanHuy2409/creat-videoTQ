@@ -1,3 +1,4 @@
+"""Trích audio mono PCM từ video bằng FFmpeg để đưa vào Azure ASR."""
 import os
 import subprocess
 import config
@@ -7,11 +8,14 @@ logger = setup_logging("audio_extractor")
 
 
 def extract_audio(video_path: str, output_path: str) -> str:
+    """Trích audio 16-bit mono ở sample rate cấu hình và kiểm tra đầu ra."""
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     sample_rate = str(config.AUDIO_SAMPLE_RATE)
 
+    # PCM WAV mono giúp Azure Speech SDK đọc ổn định và thống nhất với các
+    # bước tách giọng, ghép timeline phía sau.
     cmd = [
         "ffmpeg", "-i", video_path,
         "-vn",

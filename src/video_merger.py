@@ -1,31 +1,78 @@
+"""Ghép audio lồng tiếng vào video và tùy chọn burn phụ đề bằng FFmpeg."""
+
 import os
 import re
+import shutil
 import subprocess
 from src.utils import setup_logging
+from src.video_quality import build_lossless_video_args
+from src.subtitle_fonts import FONT_DIR, get_font, validate_size, needs_cjk_fallback
+from src.subtitle_style import SubtitleStyle
+from src.subtitle_chunks import split_caption_entries
 
 logger = setup_logging("video_merger")
 
-# Prefer ffmpeg-full (has libass / drawtext) if installed, fall back to system ffmpeg
-_FFMPEG_FULL = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
-FFMPEG_BIN = _FFMPEG_FULL if os.path.exists(_FFMPEG_FULL) else "ffmpeg"
+def _find_ffmpeg_bin() -> str:
+    """Tìm FFmpeg có đủ filter phụ đề, ưu tiên bản ``ffmpeg-full``.
 
-# ── Subtitle style config ──────────────────────────────────────────────────────
-WORDS_PER_CHUNK = 12      # target words per on-screen chunk (8-15 range)
-FONT_SIZE       = 42      # px (increased font size for fatter look)
-# libass colour format: &HAABBGGRR  (AA=alpha 00=opaque, BB=blue, GG=green, RR=red)
-ASS_TEXT_COLOR  = "&H00FFFFFF"   # opaque white
-ASS_BACK_COLOR  = "&H00000000"   # transparent/black outline backing
-# drawtext: fontcolor / boxcolor
+    Homebrew cài ``ffmpeg-full`` ở dạng keg-only nên binary thường không nằm
+    trực tiếp trong ``PATH``. Dùng ``brew --prefix`` để tìm động, tránh phụ
+    thuộc vào đường dẫn người dùng hoặc một máy cụ thể.
+    """
+    configured = os.environ.get("FFMPEG_BIN")
+    if configured:
+        return configured
+
+    # Cho phép dùng binary ``ffmpeg-full`` do người dùng đặt trong PATH.
+    found = shutil.which("ffmpeg-full")
+    if found:
+        return found
+
+    # Với Homebrew, ffmpeg-full là keg-only nên cần lấy prefix của formula.
+    brew = shutil.which("brew")
+    if brew:
+        try:
+            result = subprocess.run(
+                [brew, "--prefix", "ffmpeg-full"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            candidate = os.path.join(result.stdout.strip(), "bin", "ffmpeg")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Chỉ dùng bản FFmpeg thường sau khi đã thử mọi vị trí của ffmpeg-full.
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    # Để thông báo lỗi bên dưới vẫn được sinh ra rõ ràng nếu máy chưa cài FFmpeg.
+    return "ffmpeg"
+
+
+FFMPEG_BIN = _find_ffmpeg_bin()
+
+# ── Cấu hình kiểu phụ đề ───────────────────────────────────────────────────────
+WORDS_PER_CHUNK = 12      # số từ mục tiêu trong một chunk trên màn hình
+FONT_SIZE       = 56      # px — đủ lớn cho video dọc trên điện thoại
+# Màu libass có dạng &HAABBGGRR (alpha, blue, green, red).
+ASS_TEXT_COLOR  = "&H00FFFFFF"   # trắng, alpha 00 là không trong suốt
+ASS_BACK_COLOR  = "&H00000000"   # nền/viền đen
+# drawtext: màu chữ và màu hộp nền.
 DT_FONT_COLOR   = "white"
+DT_ZONE_FONT_COLOR = "black"  # chữ đen trên hộp che màu trắng
 DT_BOX_COLOR    = "black"
 DT_BOX_BORDER   = 0
-# vertical position default: bottom 28% of screen (y = 72% from top)
+# Vị trí Y mặc định: 28% phía dưới màn hình (Y = 72% tính từ đỉnh).
 Y_EXPR          = "(h*0.72)"
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 def _has_filter(name: str) -> bool:
-    """Check whether the active ffmpeg binary supports a given filter."""
+    """Kiểm tra bản FFmpeg hiện tại có hỗ trợ filter được yêu cầu không."""
     try:
         out = subprocess.run([FFMPEG_BIN, "-filters"], capture_output=True, text=True)
         return name in out.stdout
@@ -33,10 +80,10 @@ def _has_filter(name: str) -> bool:
         return False
 
 
-# ── SRT parsing ───────────────────────────────────────────────────────────────
+# ── Phân tích SRT ──────────────────────────────────────────────────────────────
 
 def _parse_srt(srt_path: str) -> list[dict]:
-    """Parse SRT → list of {start, end, text} (times in seconds)."""
+    """Đọc SRT thành ``{start, end, text}``, trong đó thời gian tính bằng giây."""
     entries = []
     with open(srt_path, encoding="utf-8") as f:
         content = f.read()
@@ -66,66 +113,14 @@ def _parse_srt(srt_path: str) -> list[dict]:
 
 
 def _split_into_chunks(entries: list[dict], words_per_chunk: int = WORDS_PER_CHUNK) -> list[dict]:
-    """
-    Split each entry into chunks:
-    - Split at periods (.) so that sentences end a subtitle chunk.
-    - If a sentence is longer than 15 words, split it into sub-chunks of 8-15 words (target 10 words).
-    - Distribute time proportionally.
-    """
-    import re
-    result = []
-    for entry in entries:
-        # Split by periods, keeping the periods attached to the sentence
-        sentences = re.split(r'(?<=\.)\s*', entry["text"].strip())
-        sentences = [s.strip() for s in sentences if s.strip()]
-
-        sub_chunks = []
-        for sentence in sentences:
-            words = sentence.split()
-            if len(words) <= 15:
-                sub_chunks.append(sentence)
-            else:
-                # If longer than 15 words, split into smaller chunks of 10 words
-                for i in range(0, len(words), 10):
-                    chunk_words = words[i:i + 10]
-                    sub_chunks.append(" ".join(chunk_words))
-
-        if not sub_chunks:
-            continue
-
-        if len(sub_chunks) == 1:
-            result.append({
-                "start": entry["start"],
-                "end": entry["end"],
-                "text": sub_chunks[0]
-            })
-            continue
-
-        # Distribute time proportionally based on character length
-        total_chars = sum(len(c) for c in sub_chunks)
-        if total_chars == 0:
-            continue
-
-        total_dur = entry["end"] - entry["start"]
-        start = entry["start"]
-        for chunk_text in sub_chunks:
-            char_pct = len(chunk_text) / total_chars
-            chunk_dur = total_dur * char_pct
-            result.append({
-                "start": round(start, 3),
-                "end": round(start + chunk_dur, 3),
-                "text": chunk_text
-            })
-            start += chunk_dur
-
-    logger.info(f"  Subtitle chunks: {len(entries)} SRT entries → {len(result)} display chunks")
-    return result
+    """Legacy entry point; short phrases retain each original speech interval."""
+    return split_caption_entries(entries, max_words=words_per_chunk)
 
 
-# ── libass (subtitles filter) path ────────────────────────────────────────────
+# ── Nhánh libass (filter phụ đề) ──────────────────────────────────────────────
 
 def _write_chunked_srt(entries: list[dict], out_path: str) -> None:
-    """Write a new SRT file from a list of {start,end,text} dicts with padded spaces to mask old subtitles."""
+    """Ghi SRT mới từ các chunk và thêm khoảng đệm quanh text."""
     def fmt(sec: float) -> str:
         h  = int(sec // 3600)
         m  = int((sec % 3600) // 60)
@@ -137,7 +132,7 @@ def _write_chunked_srt(entries: list[dict], out_path: str) -> None:
     for idx, e in enumerate(entries, 1):
         lines.append(str(idx))
         lines.append(f"{fmt(e['start'])} --> {fmt(e['end'])}")
-        # Pad with 3 spaces on each side to make the white background box wider (masks old text completely)
+        # Khoảng trắng giúp hộp nền trắng rộng hơn, che được chữ cũ hoàn toàn.
         lines.append(f"   {e['text']}   ")
         lines.append("")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -145,15 +140,27 @@ def _write_chunked_srt(entries: list[dict], out_path: str) -> None:
 
 
 def _escape_subtitles_path(path: str) -> str:
-    return path.replace("\\", "/").replace(":", "\\:")
+    """Escape đường dẫn để đưa an toàn vào chuỗi filter của FFmpeg."""
+    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
 
 
-def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: int, y_pixel: float, font_size: int = 40) -> None:
-    """Write subtitle entries into a v4.00+ ASS file.
-    y_pixel = vertical centre of the subtitle zone (pixels from top of frame).
-    Alignment 2 = bottom-centre; MarginV = distance from bottom of frame to bottom of text.
-    To centre text at y_pixel: margin_v = frame_h - (y_pixel + font_size//2)
+def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: int, y_pixel: float,
+                    font_size: int = 56, font_name: str | None = None,
+                    subtitle_style: SubtitleStyle | None = None) -> None:
+    """Ghi các entry thành file ASS và căn tâm chữ theo tọa độ Y đã chọn.
+
+    ASS dùng centisecond thay vì millisecond. Alignment 2 là căn giữa phía
+    dưới, vì vậy ``MarginV`` được tính ngược từ tâm vùng phụ đề.
     """
+    selected = get_font(font_name)
+    font_size = validate_size(font_size)
+    colors = subtitle_style or SubtitleStyle.from_settings()
+    def ass_color(color, opacity=100):
+        alpha = round(255 * (1 - opacity / 100))
+        return f"&H{alpha:02X}{color[5:7]}{color[3:5]}{color[1:3]}"
+    text_color = ass_color(colors.text_color)
+    outline_color = ass_color(colors.outline_color)
+    box_color = ass_color(colors.bg_color, colors.bg_opacity)
     if y_pixel >= frame_h or y_pixel <= 0:
         y_pixel = int(frame_h * 0.85)
     margin_v = int(frame_h - (y_pixel + font_size // 2))
@@ -161,13 +168,11 @@ def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: i
         margin_v = 4
 
     def fmt(sec: float) -> str:
-        h = int(sec // 3600)
-        m = int((sec % 3600) // 60)
-        s = int(sec % 60)
-        ms = int(round((sec - int(sec)) * 100)) # ASS uses centiseconds
-        if ms >= 100:
-            ms = 99
-        return f"{h:d}:{m:02d}:{s:02d}.{ms:02d}"
+        # Round total centiseconds before splitting to carry across seconds/minutes.
+        whole, cs = divmod(round(sec * 100), 100)
+        h, remaining = divmod(whole, 3600)
+        m, s = divmod(remaining, 60)
+        return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
     lines = [
         "[Script Info]",
@@ -178,8 +183,12 @@ def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: i
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        # Default style is outline-based (BorderStyle=1) with 3.5px outline and 1px shadow, using white text color and black outline/shadow
-        f"Style: Default,Phudu,{font_size},{ASS_TEXT_COLOR},&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3.5,1,2,10,10,{margin_v},1",
+        # Dùng viền đậm để chữ lớn vẫn đọc được trên nền sáng, nhiều chi tiết.
+        f"Style: Default,{selected.family},{font_size},{text_color},&H000000FF,{outline_color},&HFF000000,{selected.ass_bold},0,0,0,100,100,0,0,1,4.5,0,2,10,10,{margin_v},1",
+        f"Style: Japanese,{get_font('Noto Sans JP').family},{font_size},{text_color},&H000000FF,{outline_color},&HFF000000,-1,0,0,0,100,100,0,0,1,4.5,0,2,10,10,{margin_v},1",
+        # Separate box and glyph layers allow independent background/outline colours.
+        f"Style: DefaultBox,{selected.family},{font_size},&HFF000000,&HFF000000,{box_color},&HFF000000,{selected.ass_bold},0,0,0,100,100,0,0,3,10,0,2,10,10,{margin_v},1",
+        f"Style: JapaneseBox,{get_font('Noto Sans JP').family},{font_size},&HFF000000,&HFF000000,{box_color},&HFF000000,-1,0,0,0,100,100,0,0,3,10,0,2,10,10,{margin_v},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
@@ -191,15 +200,19 @@ def _write_ass_file(entries: list[dict], out_path: str, frame_w: int, frame_h: i
             continue
         start_str = fmt(e["start"])
         end_str = fmt(e["end"])
-        lines.append(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{text}")
+        style = "Japanese" if needs_cjk_fallback(text) else "Default"
+        if colors.bg_enabled and colors.bg_opacity:
+            lines.append(f"Dialogue: 0,{start_str},{end_str},{style}Box,,0,0,0,,{text}")
+        lines.append(f"Dialogue: 1,{start_str},{end_str},{style},,0,0,0,,{text}")
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
 
-# ── drawtext (freetype) path ──────────────────────────────────────────────────
+# ── Nhánh drawtext (freetype) ──────────────────────────────────────────────────
 
 def _escape_drawtext(text: str) -> str:
+    """Escape các ký tự đặc biệt của filter drawtext."""
     text = text.replace("\\", "\\\\")
     text = text.replace("'",  "\u2019")   # curly apostrophe (safe)
     text = text.replace(":",  "\\:")
@@ -207,57 +220,103 @@ def _escape_drawtext(text: str) -> str:
     return text
 
 
-def _find_bold_font() -> str | None:
-    """Return the custom font path specified by the user, preferring Black and Bold weights."""
-    paths = [
-        "/Users/mac/Desktop/Auto-Translade-video/Phudu-Black.ttf",
-        "/Users/mac/Desktop/Auto-Translade-video/Phudu-Bold.ttf",
-        "/Users/mac/Desktop/Auto-Translade-video/Phudu-SemiBold.ttf",
-    ]
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    return None
+def _find_bold_font(font_name: str | None = None) -> str:
+    """Resolve the exact bundled font instead of guessing a system face."""
+    return str(get_font(font_name).path)
 
 
-def _build_drawtext_filter(chunks: list[dict], frame_h: int = 1080, y_pixel: float = 780.0, font_size: int = 40) -> str:
-    """Build a chained drawtext filter for all subtitle chunks with white text and black borders."""
+def _build_drawtext_filter(chunks: list[dict], frame_h: int = 1080, y_pixel: float = 780.0,
+                           font_size: int = 56, font_name: str | None = None,
+                           subtitle_style: SubtitleStyle | None = None, frame_w: int = 1920) -> str:
+    """Tạo chuỗi drawtext cho các chunk với chữ trắng và viền đen."""
     if y_pixel >= frame_h or y_pixel <= 0:
         y_pixel = int(frame_h * 0.85)
-    # y_pixel = vertical centre; drawtext y anchors at top of text, so shift up by half font height
+    # y_pixel là tâm dọc; drawtext neo ở đỉnh chữ nên dịch lên nửa chiều cao font.
     y_top = max(0, int(y_pixel) - font_size // 2)
-    font_path = _find_bold_font()
+    font_size = validate_size(font_size)
+    selected = get_font(font_name)
+    colors = subtitle_style or SubtitleStyle.from_settings()
     filters   = []
 
     for chunk in chunks:
-        # No extra spaces needed since there's no background box
-        text  = _escape_drawtext(chunk['text'])
+        font_path = str(get_font("Noto Sans JP").path if needs_cjk_fallback(chunk['text']) else selected.path)
+        # Wrap the whole sentence spatially, without inventing word timestamps.
+        from PIL import ImageFont
+        font = ImageFont.truetype(font_path, font_size)
+        lines, line = [], ""
+        max_width = max(font_size, frame_w * .9)
+        for word in chunk['text'].split():
+            candidate = f"{line} {word}".strip()
+            if font.getlength(candidate) <= max_width:
+                line = candidate
+                continue
+            if line:
+                lines.append(line)
+                line = ""
+            for char in word:
+                if line and font.getlength(line + char) > max_width:
+                    lines.append(line)
+                    line = ""
+                line += char
+        if line:
+            lines.append(line)
+        text = _escape_drawtext("\n".join(lines))
         start = chunk["start"]
         end   = chunk["end"]
-        y_expr = str(y_top)   # top of text = y_center - half_font → text centered at y_pixel
+        # Đặt đỉnh chữ lên trên tâm một nửa cỡ font để chữ nằm giữa tại y_pixel.
+        y_expr = str(y_top)
 
         parts = [
             f"text='{text}'",
-            f"fontcolor=white",
+            f"fontcolor=0x{colors.text_color[1:]}",
             f"fontsize={font_size}",
-            "borderw=3.5",
-            "bordercolor=black",
-            "x=(w-text_w)/2",          # centered horizontally
-            f"y={y_expr}",             # bottom 1/3 of screen
-            f"enable='between(t,{start:.3f},{end:.3f})'",
+            "borderw=4.5",
+            f"bordercolor=0x{colors.outline_color[1:]}",
+            f"box={int(colors.bg_enabled and colors.bg_opacity > 0)}",
+            f"boxcolor=0x{colors.bg_color[1:]}@{colors.bg_opacity / 100:.2f}",
+            "boxborderw=10",
+            "x=(w-text_w)/2",          # căn giữa theo chiều ngang
+            f"y={y_expr}",             # vùng 1/3 phía dưới màn hình
+            f"enable='gte(t,{start:.3f})*lt(t,{end:.3f})'",
         ]
         if font_path:
-            parts.insert(0, f"fontfile={font_path}")
+            escaped_font_path = _escape_subtitles_path(font_path)
+            parts.insert(0, f"fontfile='{escaped_font_path}'")
         filters.append("drawtext=" + ":".join(parts))
 
     return ",".join(filters)
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+def _build_display_chunks(srt_path: str) -> list[dict]:
+    """Cap captions at 15 words, preserving already-timed short SRT phrases."""
+    return split_caption_entries(_parse_srt(srt_path))
+
+
+def _get_video_dimensions(video_path: str) -> tuple[int, int]:
+    """Đọc chiều rộng/cao của video, đồng thời kiểm tra video có mở được không."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+
+    if frame_w <= 0 or frame_h <= 0:
+        raise RuntimeError(f"Cannot read video dimensions: {video_path}")
+    return frame_w, frame_h
+
+
+# ── API công khai ─────────────────────────────────────────────────────────────
 
 def merge_video(video_path: str, audio_path: str, output_path: str,
                 srt_path: str | None = None, y_pixel: float = 780.0,
-                font_size: int = 40) -> str:
+                font_size: int = 56, _video_filter: str | None = None,
+                font_name: str | None = None, subtitle_style: SubtitleStyle | None = None) -> str:
+    """Ghép audio vào video, stream-copy nếu không cần thay đổi hình ảnh."""
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
     if not os.path.exists(audio_path):
@@ -267,67 +326,66 @@ def merge_video(video_path: str, audio_path: str, output_path: str,
 
     cmd = [FFMPEG_BIN, "-i", video_path, "-i", audio_path]
 
-    if srt_path and os.path.exists(srt_path):
+    video_reencoded = False
+
+    if _video_filter:
+        cmd += ["-vf", _video_filter, *build_lossless_video_args(video_path)]
+        video_reencoded = True
+    elif srt_path and os.path.exists(srt_path):
         logger.info(f"Burning subtitles from {srt_path} onto video at Y={y_pixel}px, size={font_size}px")
 
-        raw_entries = _parse_srt(srt_path)
-        chunks      = _split_into_chunks(raw_entries)
+        chunks = _build_display_chunks(srt_path)
 
-        # Extend chunk end times to touch the next chunk's start time (capped at 2 seconds)
-        for i in range(len(chunks) - 1):
-            spoken_dur = chunks[i]["end"] - chunks[i]["start"]
-            gap_dur = chunks[i + 1]["start"] - chunks[i]["start"]
-            chunks[i]["end"] = chunks[i]["start"] + max(spoken_dur, min(gap_dur, 2.0))
+        # SRT rỗng/không hợp lệ không làm đổi pixel, nên vẫn giữ nguyên stream
+        # video nén ban đầu.
+        if not chunks:
+            logger.info("No subtitle entries found; copying the original video stream")
+
         if chunks:
-            spoken_dur = chunks[-1]["end"] - chunks[-1]["start"]
-            # Keep the last chunk visible for at least 2.0 seconds
-            chunks[-1]["end"] = chunks[-1]["start"] + max(spoken_dur, 2.0)
+            # ── Phương án 1: filter phụ đề/libass (chất lượng tốt nhất) ───────
+            if _has_filter("subtitles"):
+                frame_w, frame_h = _get_video_dimensions(video_path)
 
-        # ── Option 1: libass subtitles filter (best quality) ──────────────────
-        if _has_filter("subtitles"):
-            import cv2
-            cap = cv2.VideoCapture(video_path)
-            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
+                # Tạo file ASS tạm từ các chunk đã chia.
+                chunked_ass = srt_path.replace(".srt", "_chunked.ass")
+                _write_ass_file(chunks, chunked_ass, frame_w, frame_h, y_pixel, font_size, font_name, subtitle_style)
+                escaped = _escape_subtitles_path(chunked_ass)
+                escaped_fontsdir = _escape_subtitles_path(str(FONT_DIR))
+                subtitle_vf = f"subtitles=filename='{escaped}':fontsdir='{escaped_fontsdir}'"
+                cmd += ["-vf", subtitle_vf, *build_lossless_video_args(video_path)]
+                video_reencoded = True
+                logger.info("  Using subtitles filter (libass) with lossless video encode")
 
-            # Write a new ASS file with the split chunks
-            chunked_ass = srt_path.replace(".srt", "_chunked.ass")
-            _write_ass_file(chunks, chunked_ass, frame_w, frame_h, y_pixel, font_size)
-            escaped = _escape_subtitles_path(chunked_ass)
-            project_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-            escaped_fontsdir = project_dir.replace("\\", "/").replace(":", "\\:")
-            subtitle_vf = f"subtitles=filename='{escaped}':fontsdir='{escaped_fontsdir}'"
-            vf = subtitle_vf
-            cmd += [
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-            ]
-            logger.info("  Using subtitles filter (libass) with chunked ASS")
+            # ── Phương án 2: drawtext (không có libass, cần freetype) ──────────
+            elif _has_filter("drawtext"):
+                frame_w, frame_h = _get_video_dimensions(video_path)
 
-        # ── Option 2: drawtext filter (no libass, needs freetype) ─────────────
-        elif _has_filter("drawtext"):
-            import cv2
-            cap = cv2.VideoCapture(video_path)
-            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
+                subtitle_vf = _build_drawtext_filter(chunks, frame_h, y_pixel, font_size, font_name, subtitle_style, frame_w)
+                cmd += ["-vf", subtitle_vf, *build_lossless_video_args(video_path)]
+                video_reencoded = True
+                logger.info(f"  Using drawtext filter ({len(chunks)} chunks) with lossless video encode")
 
-            subtitle_vf = _build_drawtext_filter(chunks, frame_h, y_pixel, font_size)
-            vf = subtitle_vf
-            cmd += [
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22"
-            ]
-            logger.info(f"  Using drawtext filter ({len(chunks)} chunks)")
+            # ── Phương án 3: không có filter chữ ───────────────────────────────
+            else:
+                raise RuntimeError(
+                    "FFmpeg không hỗ trợ filter 'subtitles' hoặc 'drawtext'. "
+                    "Hãy cài bản FFmpeg có libass/freetype và bảo đảm ffmpeg nằm trong PATH."
+                )
 
-        # ── Option 3: no text filter available ───────────────────────────────
-        else:
-            logger.warning("No drawtext/subtitles filter available - skipping all overlays")
-            cmd += ["-c:v", "copy"]
-    else:
+    if not video_reencoded:
+        # Không có filter hình ảnh thì copy stream thật sự; bitstream và chất
+        # lượng video gốc không bị encode lại.
         cmd += ["-c:v", "copy"]
 
-    cmd += ["-map", "0:v", "-map", "1:a", "-y", output_path]
+    cmd += [
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-map_metadata", "0",
+        "-map_chapters", "0",
+        "-fps_mode", "passthrough",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
 
     logger.info(f"Merging video + audio → {output_path}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -338,76 +396,7 @@ def merge_video(video_path: str, audio_path: str, output_path: str,
     return output_path
 
 
-# ── OCR-replace mode ──────────────────────────────────────────────────────────
-
-def _build_ocr_replace_filter(chunks: list[dict], frame_w: int, frame_h: int) -> str:
-    """
-    FFmpeg vf chain:
-      For each chunk:
-        - If a precise subtitle zone is detected on this chunk:
-          1. drawbox  → white rectangle covering the Y range of the subtitle,
-                         active ONLY during the chunk duration.
-          2. drawtext → Vietnamese text centered horizontally and vertically inside that zone.
-        - If no subtitle is detected:
-          1. drawtext → Vietnamese text with box=1 at fallback bottom position.
-    """
-    font_path    = _find_bold_font()
-    filters      = []
-
-    for chunk in chunks:
-        text  = _escape_drawtext(chunk["text"])
-        start = chunk["start"]
-        end   = chunk["end"]
-        enable_str = f"enable='between(t,{start:.3f},{end:.3f})'"
-
-        zone = chunk.get("zone")
-        if zone:
-            y = zone["y"]
-            h = zone["height"]
-
-            # 1. Drawbox covering full width at this precise Y height
-            cover_parts = [
-                "x=0",
-                f"y={y}",
-                f"w={frame_w}",
-                f"h={h}",
-                "color=white",
-                "t=fill",
-                enable_str
-            ]
-            filters.append("drawbox=" + ":".join(cover_parts))
-
-            # 2. Drawtext centered in the cover box
-            text_parts = [
-                f"text='{text}'",
-                f"fontcolor={DT_FONT_COLOR}",
-                f"fontsize={FONT_SIZE}",
-                "x=(w-text_w)/2",
-                f"y={y} + ({h}-text_h)/2",  # vertical centering in the box
-                enable_str
-            ]
-            if font_path:
-                text_parts.insert(0, f"fontfile={font_path}")
-            filters.append("drawtext=" + ":".join(text_parts))
-        else:
-            # Fallback when no subtitle is detected: drawtext with a background box at bottom 1/3
-            text_parts = [
-                f"text='{text}'",
-                f"fontcolor={DT_FONT_COLOR}",
-                f"fontsize={FONT_SIZE}",
-                "box=1",
-                f"boxcolor={DT_BOX_COLOR}",
-                f"boxborderw={DT_BOX_BORDER}",
-                "x=(w-text_w)/2",
-                f"y={Y_EXPR}",
-                enable_str
-            ]
-            if font_path:
-                text_parts.insert(0, f"fontfile={font_path}")
-            filters.append("drawtext=" + ":".join(text_parts))
-
-    return ",".join(filters)
-
+# ── Chế độ thay phụ đề bằng OCR ───────────────────────────────────────────────
 
 def merge_video_with_ocr_replace(
     video_path: str,
@@ -415,16 +404,53 @@ def merge_video_with_ocr_replace(
     output_path: str,
     srt_path: str,
     y_pixel: float = 780.0,
-    subtitle_size: int = 40,
+    subtitle_size: int = 56,
+    subtitle_font: str | None = None,
+    subtitle_style: SubtitleStyle | None = None,
 ) -> str:
-    """OCR replace mode has been deprecated and replaced by manual Y-pixel placement replacement."""
-    logger.info(f"OCR Replace mode active: using manual Y-pixel replace at {y_pixel}px, size={subtitle_size}px")
+    """Dùng OCR + xử lý ảnh cục bộ để xoá phụ đề gốc rồi burn SRT tiếng Việt.
+
+    Bản cũ dùng ``drawbox=color=white`` nên vừa không xử lý đúng nền ảnh vừa
+    khiến phụ đề gốc vẫn còn khi OCR không trả confidence đủ cao. Nhánh này
+    dùng cùng bộ xử lý ảnh với pipeline chính và chỉ gọi merge để đặt chữ sau
+    khi video đã được làm sạch.
+    """
+    if not os.path.exists(srt_path):
+        raise FileNotFoundError(f"Subtitle file not found: {srt_path}")
+    from src.ocr_image_replace import OCR_IMAGE_REPLACE_MODE, apply_ocr_image_replace
+    from src.video_quality import has_current_quality_marker
+
+    cleaned_path = f"{output_path}.ocr_cleaned.mp4"
+    if (
+        os.path.exists(cleaned_path)
+        and os.path.getsize(cleaned_path) > 0
+        and has_current_quality_marker(cleaned_path, OCR_IMAGE_REPLACE_MODE)
+    ):
+        logger.info(f"Reusing OCR-cleaned intermediate video: {cleaned_path}")
+    else:
+        if not apply_ocr_image_replace(video_path, cleaned_path):
+            raise RuntimeError(
+                "OCR không thể xoá chữ Trung trong vùng đã cấu hình; "
+                "không tiếp tục render để tránh giữ phụ đề gốc."
+            )
+
+    # Bộ xử lý ảnh ghi lại tâm dòng phụ đề theo pixel. Đọc lại sau khi clean để
+    # không dùng tọa độ cũ từ một lần chạy AI blur trước đó.
+    render_y = y_pixel
+    y_path = os.path.join(os.path.dirname(output_path), "subtitle_y_pos.txt")
+    try:
+        with open(y_path, encoding="utf-8") as handle:
+            render_y = float(handle.read().strip())
+    except (OSError, ValueError):
+        pass
+
     return merge_video(
-        video_path=video_path,
+        video_path=cleaned_path,
         audio_path=audio_path,
         output_path=output_path,
         srt_path=srt_path,
-        y_pixel=y_pixel,
+        y_pixel=render_y,
         font_size=subtitle_size,
+        font_name=subtitle_font,
+        subtitle_style=subtitle_style,
     )
-

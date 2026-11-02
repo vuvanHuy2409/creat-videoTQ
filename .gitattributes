@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve third-party font license text exactly as supplied upstream.
+assets/fonts/licenses/* -text -whitespace

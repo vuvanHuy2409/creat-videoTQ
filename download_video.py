@@ -1,12 +1,11 @@
-"""Download TikTok / Douyin / YouTube videos for later pipeline processing.
+"""Tải video TikTok/Douyin/YouTube để xử lý bằng pipeline sau đó.
 
-Handles non-canonical Douyin URLs such as:
+Hỗ trợ URL Douyin không chuẩn như:
     https://www.douyin.com/jingxuan?modal_id=7623494985249262886
     https://www.douyin.com/discover?modal_id=<id>
 
-These are rewritten to https://www.douyin.com/video/<id> before passing to
-yt-dlp. Other formats (canonical Douyin, TikTok long/short links, YouTube,
-and the 1000+ sites yt-dlp supports) work without changes.
+Các URL này được đổi thành ``https://www.douyin.com/video/<id>`` trước khi
+xử lý; những website khác vẫn được chuyển thẳng cho yt-dlp.
 
 Usage:
     python download_video.py URL                            # single URL
@@ -14,11 +13,10 @@ Usage:
     python download_video.py --file urls.txt                # one URL per line
     python download_video.py URL --output-dir downloads/    # custom folder
     python download_video.py URL --cookies-from-browser chrome
-                                                            # auth-walled videos
+                                                            # video yêu cầu đăng nhập
 
-After download a manifest_<timestamp>.json is written into the output folder
-listing every video's URL, platform, file path, title, and duration — feed
-this into pipeline.py with --file <path> for batch processing.
+Sau khi tải, script ghi ``manifest_<timestamp>.json`` gồm URL, nền tảng, đường
+dẫn file, tiêu đề và thời lượng của từng video.
 """
 import argparse
 import json
@@ -42,8 +40,9 @@ def _build_ydl_opts(
     cookies_from_browser: str | None,
     cookies_file: str | None,
 ) -> dict:
+    """Tạo option yt-dlp, gồm cookie trình duyệt hoặc cookie file nếu có."""
     opts = {
-        # Use extractor + id as filename so TikTok/Douyin/YouTube don't collide
+        # Ghép extractor + ID để file TikTok/Douyin/YouTube không trùng tên.
         "outtmpl": os.path.join(output_dir, "%(extractor_key)s_%(id)s.%(ext)s"),
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "merge_output_format": "mp4",
@@ -59,7 +58,7 @@ def _build_ydl_opts(
 
 
 def _resolve_filepath(info: dict, output_dir: str) -> str:
-    """yt-dlp may rename during merge; locate the actual saved file."""
+    """Tìm file thực tế vì yt-dlp có thể đổi tên sau khi merge stream."""
     extractor = info.get("extractor_key", info.get("extractor", "video"))
     video_id = info.get("id", "video")
     ext = info.get("ext", "mp4")
@@ -82,11 +81,9 @@ def download_one(
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
 ) -> dict:
-    """Download a single URL and return metadata + saved filepath.
+    """Tải một URL và trả metadata cùng đường dẫn file.
 
-    Douyin URLs (including short-link v.douyin.com/...) are routed to a
-    Playwright-based extractor because yt-dlp's Douyin path is broken upstream.
-    All other sites continue through yt-dlp.
+    URL Douyin được chuyển sang extractor Playwright; các site khác dùng yt-dlp.
     """
     if is_douyin_url(url):
         logger.info(f"Routing to Playwright Douyin extractor: {url}")
@@ -116,6 +113,7 @@ def download_one(
 
 
 def _read_urls_from_file(path: str) -> list[str]:
+    """Đọc URL không rỗng, bỏ qua dòng bắt đầu bằng ``#``."""
     with open(path, "r", encoding="utf-8") as f:
         return [
             line.strip() for line in f
@@ -124,6 +122,7 @@ def _read_urls_from_file(path: str) -> list[str]:
 
 
 def main():
+    """Điều phối tải nhiều URL và ghi manifest thành công/thất bại."""
     parser = argparse.ArgumentParser(
         description="Download TikTok/Douyin/YouTube videos via yt-dlp.",
     )
@@ -158,7 +157,7 @@ def main():
     if args.file:
         urls.extend(_read_urls_from_file(args.file))
 
-    # De-duplicate while preserving order
+    # Loại URL trùng nhưng giữ nguyên thứ tự người dùng nhập.
     seen = set()
     urls = [u for u in urls if not (u in seen or seen.add(u))]
 

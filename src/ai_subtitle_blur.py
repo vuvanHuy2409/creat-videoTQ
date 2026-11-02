@@ -1,10 +1,19 @@
+"""Phát hiện và làm mờ phụ đề cứng bằng EasyOCR trên từng frame video."""
 import cv2
 import os
 import numpy as np
 import subprocess
 from src.utils import setup_logging
+from src.ocr_zone import (
+    OCR_ZONE_LABEL,
+    crop_ocr_scan_zone,
+    get_ocr_scan_bounds,
+    get_ocr_zone_bounds,
+)
+from src.video_quality import build_lossless_video_args, write_quality_marker
 
 logger = setup_logging("ai_subtitle_blur")
+AI_BLUR_MODE = "ai_blur_v2"
 
 
 def apply_ai_blur(
@@ -20,6 +29,7 @@ def apply_ai_blur(
     - Blur chính xác vùng chữ + viền mờ dần tự nhiên
     """
     logger.info(f"AI subtitle blur: {video_path} → {output_path}")
+    logger.info(f"OCR scan zone: {OCR_ZONE_LABEL}")
 
     import easyocr
     import torch
@@ -48,7 +58,10 @@ def apply_ai_blur(
     h_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     logger.info(f"Video {w_orig}×{h_orig} @ {video_fps:.1f}fps  {total_frames} frames")
 
-    # ── ffmpeg nhận raw frame BGR từ stdin ───────────────────────────────────
+    # ── FFmpeg nhận frame BGR thô từ stdin ───────────────────────────────────
+    # Vì OpenCV đã thay đổi pixel nên bắt buộc phải encode lại. Dùng cùng
+    # chính sách chất lượng với các bước render khác và giữ metadata màu gốc.
+    video_encode_args = build_lossless_video_args(video_path)
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -56,8 +69,11 @@ def apply_ai_blur(
         "-r", str(video_fps), "-i", "-",
         "-i", video_path,
         "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "16",
-        "-pix_fmt", "yuv420p", "-c:a", "copy",
+        *video_encode_args,
+        "-map_metadata", "1", "-map_chapters", "1",
+        "-fps_mode", "passthrough",
+        "-movflags", "+faststart",
+        "-c:a", "copy",
         output_path,
     ]
     ffmpeg_proc = subprocess.Popen(
@@ -73,17 +89,26 @@ def apply_ai_blur(
         enhanced = clahe.apply(gray)
         return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
-    # ── Nhận diện text, trả về toạ độ frame gốc (được scan toàn bộ khung hình) ──────────
+    # ── Nhận diện text, trả về toạ độ frame gốc ──────────────────────────────
     def _detect_text(frame):
         fh, fw = frame.shape[:2]
 
-        # Scan toàn bộ frame (không cắt)
-        img = frame.copy()
+        # Cắt trước khi OCR: chữ ngoài dải phụ đề không bao giờ được gửi cho
+        # EasyOCR, nhờ đó không bị làm mờ nhầm ở vị trí khác trên frame.
+        # Có thêm dải đệm ở mốc 80% để EasyOCR không nhận một dòng chữ bị
+        # cắt ngang; box vẫn bắt buộc phải giao với vùng chính 20%-40% từ đáy.
+        crop, y_offset = crop_ocr_scan_zone(frame)
+        if crop.size == 0:
+            return []
+        zone_top, zone_bottom = get_ocr_zone_bounds(fh)
+        _, scan_bottom = get_ocr_scan_bounds(fh)
+        crop_h, crop_w = crop.shape[:2]
+        img = crop.copy()
 
-        # Scale lên nếu cần (EasyOCR tốt nhất ≥640px wide)
-        scale = max(1.0, 640.0 / fw)
+        # Phóng to nếu cần (EasyOCR thường nhận tốt hơn khi ảnh rộng từ 640 px).
+        scale = max(1.0, 640.0 / crop_w)
         if scale > 1.0:
-            img = cv2.resize(img, (int(fw * scale), int(fh * scale)),
+            img = cv2.resize(img, (int(crop_w * scale), int(crop_h * scale)),
                              interpolation=cv2.INTER_CUBIC)
 
         img = _preprocess_crop(img)
@@ -113,9 +138,16 @@ def apply_ai_blur(
             ys = [pt[1] for pt in bbox]
             
             gx1 = max(0, int(min(xs) / scale))
-            gy1 = max(0, int(min(ys) / scale))
+            gy1 = y_offset + max(0, int(min(ys) / scale))
             gx2 = min(fw, int(max(xs) / scale))
-            gy2 = min(fh, int(max(ys) / scale))
+            gy2 = y_offset + min(crop_h, int(max(ys) / scale))
+
+            # Box phải giao với vùng OCR chính, nhưng được phép vươn xuống
+            # dải đệm để xoá trọn chữ chạm đúng mốc 80%.
+            if gy2 <= zone_top or gy1 >= zone_bottom:
+                continue
+            gy1 = max(zone_top, gy1)
+            gy2 = min(scan_bottom, gy2)
             
             # Lọc nhiễu CỰC KỲ KHẮT KHE: BẮT BUỘC phải có chứa ký tự tiếng Trung
             # Ký tự tiếng Trung nằm trong dải Unicode \u4e00-\u9fff
@@ -206,11 +238,11 @@ def apply_ai_blur(
             raw = _detect_text(frame)
             cached_boxes = raw
             for (x1, y1, x2, y2) in raw:
-                if y1 > h_orig * 0.40:
-                    detected_y1_list.append(y1)
-                    detected_y2_list.append(y2)
+                # _detect_text() đã cắt đúng dải OCR dùng chung.
+                detected_y1_list.append(y1)
+                detected_y2_list.append(y2)
 
-        # Apply blur + feather lên từng box
+        # Áp dụng blur và feather lên từng box đã phát hiện.
         annotated = frame.copy()
         for (x1, y1, x2, y2) in cached_boxes:
             bx1 = max(0,     x1 - PAD_X)
@@ -233,7 +265,17 @@ def apply_ai_blur(
     cap.release()
     if ffmpeg_proc:
         ffmpeg_proc.stdin.close()
-        ffmpeg_proc.wait()
+        return_code = ffmpeg_proc.wait()
+        if return_code != 0:
+            logger.error(f"Lossless AI-blur encode failed (FFmpeg exit code={return_code})")
+            return False
+
+    try:
+        write_quality_marker(output_path, video_path, AI_BLUR_MODE)
+    except OSError as exc:
+        # Video vẫn dùng được; nếu thiếu marker, lần resume sau sẽ tạo lại thay
+        # vì tin vào một bản encode không rõ chất lượng.
+        logger.warning(f"Could not write video quality marker: {exc}")
 
     # Lưu tọa độ Y trung tâm vùng phụ đề để đặt phụ đề dịch đúng chỗ
     if detected_y1_list and detected_y2_list:

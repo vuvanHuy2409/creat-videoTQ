@@ -1,3 +1,5 @@
+"""Kiểm thử tách vocal, chuẩn hóa stem và dọn file tạm khi lỗi."""
+
 import os
 from unittest import mock
 
@@ -49,15 +51,16 @@ def test_separate_vocals_returns_none_when_demucs_raises(tmp_path):
 
     assert result == {"vocals": None, "no_vocals": None}
     assert not os.path.exists(os.path.join(work_dir, "no_vocals.wav"))
-    # Raw scratch files should be cleaned up after a failed run
+    # File tạm raw phải được dọn sau một lần chạy thất bại.
     assert not os.path.exists(os.path.join(work_dir, "_vocals_raw.wav"))
     assert not os.path.exists(os.path.join(work_dir, "_no_vocals_raw.wav"))
 
 
 def test_separate_vocals_normalizes_and_cleans_up(tmp_path):
-    """Mocks a successful Demucs run plus the ffmpeg normalize step and
-    verifies the final stems land in work_dir while raw scratch files are
-    removed."""
+    """Giả lập Demucs và bước chuẩn hóa FFmpeg thành công.
+
+    Kiểm tra stem cuối nằm trong work_dir và các file raw tạm đã bị xóa.
+    """
     work_dir = str(tmp_path / "work")
     os.makedirs(work_dir)
     input_wav = str(tmp_path / "original_audio.wav")

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 
-# Ensure stdout/stderr use UTF-8 on Windows
+# Đảm bảo stdout/stderr dùng UTF-8 trên Windows.
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -170,12 +170,13 @@ def get_script(url: str, languages: list[str]) -> tuple[str, str] | None:
     if result:
         return result
 
-    # Fallback yt-dlp
+    # Dự phòng bằng yt-dlp.
     print(f"  Thử yt-dlp...")
     return fetch_via_ytdlp(url, languages)
 
 
 def main():
+    """Nhận nhiều URL YouTube, lấy transcript và ghi ra file TXT."""
     parser = argparse.ArgumentParser(description="Lấy script YouTube thành plain text")
     parser.add_argument("urls", nargs="*", help="URL video YouTube (có thể nhiều URL)")
     parser.add_argument("--file", help="Đọc URLs từ file (mỗi URL 1 dòng)")
@@ -218,7 +219,7 @@ def main():
         text, used_lang = result
         print(f"  OK: {len(text)} ký tự ({used_lang})")
 
-        # Quyết định đường dẫn output
+        # Xác định output là một file đơn hay thư mục khi có nhiều URL.
         if args.output:
             if output_is_dir:
                 video_id = extract_video_id(url) or f"video_{i}"

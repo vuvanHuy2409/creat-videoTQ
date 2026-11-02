@@ -1,3 +1,5 @@
+"""Kiểm thử việc đọc biến môi trường và giá trị mặc định của cấu hình."""
+
 import os
 import pytest
 
@@ -25,8 +27,8 @@ def test_config_loads_env_vars(monkeypatch):
 
 
 def test_config_defaults(monkeypatch):
-    """When optional env vars are not set, config should use defaults."""
-    # Prevent load_dotenv from loading .env file values
+    """Biến môi trường tùy chọn bị thiếu thì cấu hình phải dùng giá trị mặc định."""
+    # Ngăn load_dotenv nạp các giá trị từ file .env thật.
     monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **kw: None)
 
     monkeypatch.setenv("AZURE_SPEECH_KEY", "test-key")

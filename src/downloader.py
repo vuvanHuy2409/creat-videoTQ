@@ -1,3 +1,4 @@
+"""Tải video thông thường qua yt-dlp và chuyển Douyin sang downloader riêng."""
 import os
 from urllib.parse import urlparse, parse_qs
 
@@ -8,11 +9,10 @@ logger = setup_logging("downloader")
 
 
 def normalize_url(url: str) -> str:
-    """Rewrite non-canonical Douyin/TikTok URLs to a form yt-dlp can extract.
+    """Chuẩn hóa URL Douyin dạng modal về URL video mà yt-dlp hiểu được.
 
-    Douyin's web app uses modal-style routes (e.g. /jingxuan?modal_id=<id>,
-    /discover?modal_id=<id>) where the actual video id lives in the query
-    string. yt-dlp's douyin extractor expects /video/<id>, so we rewrite.
+    Douyin có thể đặt video ID trong query ``modal_id`` thay vì đường dẫn
+    ``/video/<id>``; chuyển đổi này giúp các bước sau nhận đúng video.
     """
     if not url:
         return url
@@ -37,14 +37,14 @@ def normalize_url(url: str) -> str:
 
 
 def download_video(url: str, output_dir: str) -> str:
+    """Tải một video và trả về đường dẫn file đã lưu trên đĩa."""
     if not url:
         raise ValueError("URL cannot be empty")
 
     ensure_dir(output_dir)
 
-    # Douyin's yt-dlp extractor is broken upstream (requires `a_bogus`
-    # signature). Route Douyin URLs (including v.douyin.com short links)
-    # through the Playwright-based fallback.
+    # Extractor Douyin của yt-dlp cần chữ ký a_bogus nên dễ thất bại. Các URL
+    # Douyin, kể cả short link v.douyin.com, được chuyển sang Playwright.
     from src.downloader_douyin import is_douyin_url, download_douyin
     if is_douyin_url(url):
         logger.info(f"Routing to Playwright Douyin extractor: {url}")
@@ -85,6 +85,7 @@ def download_video(url: str, output_dir: str) -> str:
 
 
 def get_video_id(url: str) -> str:
+    """Lấy ID video từ metadata của yt-dlp mà không tải file."""
     with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
         info = ydl.extract_info(url, download=False)
         return info.get("id", "video")

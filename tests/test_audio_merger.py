@@ -1,3 +1,5 @@
+"""Kiểm thử ghép segment lồng tiếng với nền im lặng hoặc audio gốc."""
+
 import os
 from pydub import AudioSegment
 from pydub.generators import Sine
@@ -62,7 +64,7 @@ def test_merge_segments_uses_background(tmp_path):
     merged = AudioSegment.from_wav(output_path)
     assert abs(len(merged) / 1000.0 - 4.0) < 0.1
 
-    # The background tone should still be audible at t=0 (no segment overlay there)
+    # Âm nền phải vẫn nghe được tại t=0 vì lúc đó chưa phủ segment lồng tiếng.
     head = merged[:300]
     silent = AudioSegment.silent(duration=300, frame_rate=merged.frame_rate)
     assert head.dBFS > silent.dBFS + 10  # at least 10 dB louder than silence
@@ -112,7 +114,7 @@ def test_merge_segments_applies_background_gain(tmp_path):
 
     full = AudioSegment.from_wav(full_output)
     quiet = AudioSegment.from_wav(quiet_output)
-    # -6 dB should drop loudness noticeably; allow a 1 dB tolerance for the
-    # round-trip through pydub + 16-bit PCM export
+    # -6 dB phải làm âm lượng giảm rõ rệt; chừa sai số 1 dB do việc chuyển
+    # qua pydub và xuất PCM 16-bit.
     assert quiet.dBFS < full.dBFS - 5
     assert abs(len(quiet) / 1000.0 - 3.0) < 0.1

@@ -1,8 +1,8 @@
-"""Video Dubbing Pipeline — CLI Entry Point.
+"""Điểm vào CLI cho pipeline lồng tiếng tiếng Nhật.
 
-Usage:
-    python pipeline.py                          # Reads VIDEO_URL from .env
-    python pipeline.py --url "https://..."      # Override with CLI arg
+Ví dụ:
+    python pipeline.py                          # đọc VIDEO_URL từ .env
+    python pipeline.py --url "https://..."      # ghi đè URL bằng tham số CLI
     python pipeline.py --file video.mp4 --source-lang vi
 """
 import argparse
@@ -13,18 +13,28 @@ import time
 from datetime import datetime
 
 import config
+from src.pipeline_history import track_pipeline, bind_project
+from src.voice_registry import pipeline_voice
+from src.subtitle_fonts import font_names, get_font, validate_size
+from src.subtitle_style import (SubtitleStyle, add_style_arguments, style_overrides_from_args,
+                                load_project_subtitles, save_project_subtitles)
 from src.utils import setup_logging, ensure_dir
 from src.downloader import download_video
 from src.audio_extractor import extract_audio
 from src.transcriber import transcribe, save_transcript
 from src.synthesizer import synthesize_segment
-from src.translate_pending import write_hint as _write_translate_pending_hint
-from src.audio_merger import merge_segments
+from src.translate_pending import (
+    has_complete_translation,
+    write_hint as _write_translate_pending_hint,
+)
+from src.audio_merger import merge_segments, fit_segments_to_timeline
 from src.vocal_separator import separate_vocals
 from src.video_merger import merge_video
 from src.srt_generator import generate_srt
+from src.subtitle_timing import generate_tts_subtitles, apply_fitted_timing_to_results
 from src.content_generator import generate_content
 from src.ai_subtitle_blur import apply_ai_blur
+from src.video_quality import has_current_quality_marker
 
 logger = setup_logging("pipeline")
 
@@ -41,9 +51,10 @@ LANG_MAP = {
 
 
 def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[dict]) -> dict:
-    """Build a timing guide JSON showing differences between original and JP audio per segment.
+    """Tạo báo cáo chênh lệch thời lượng audio gốc và audio tiếng Nhật.
 
-    Helps user quickly identify which segments need manual adjustment in CapCut.
+    Người dùng có thể dựa vào báo cáo này để biết segment nào cần chỉnh trong
+    CapCut.
     """
     guide = {
         "session_id": report["session_id"],
@@ -64,7 +75,7 @@ def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[di
     for seg, tts in zip(segments, tts_results):
         diff = round(tts["actual_duration"] - seg["duration"], 2)
 
-        # OK if JP audio within ±30% of original duration
+        # Chấp nhận nếu audio dịch nằm trong khoảng ±30% thời lượng gốc.
         if abs(diff) <= seg["duration"] * 0.3:
             status = "OK"
         elif diff > 0:
@@ -80,6 +91,7 @@ def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[di
             "text_jp": seg.get("text_jp", ""),
             "start": seg["start"],
             "end": seg["end"],
+            **{key: tts[key] for key in ("audio_start", "audio_end", "subtitle_start", "subtitle_end") if key in tts},
             "original_duration": seg["duration"],
             "jp_duration": tts["actual_duration"],
             "diff_seconds": diff,
@@ -97,6 +109,7 @@ def _build_timing_guide(report: dict, segments: list[dict], tts_results: list[di
 
 
 def parse_args() -> argparse.Namespace:
+    """Đọc tham số CLI và nạp URL mặc định từ biến môi trường nếu cần."""
     parser = argparse.ArgumentParser(description="Video Dubbing Pipeline: EN/VI → JP")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--url", help="YouTube/TikTok video URL (default: VIDEO_URL from .env)")
@@ -109,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--voice",
-        default=config.TTS_VOICE,
+        default=config.DEFAULT_VOICE_JP or config.TTS_VOICE,
         help=f"TTS voice name (default: {config.TTS_VOICE})",
     )
     parser.add_argument(
@@ -135,9 +148,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--subtitle-size",
-        type=int,
-        default=38,
-        help="Font size of subtitles in pixels (default: 38)",
+        type=validate_size,
+        default=None,
+        help="Subtitle size in pixels (12-160; default: SUBTITLE_FONT_SIZE)",
+    )
+    add_style_arguments(parser)
+    parser.add_argument(
+        "--subtitle-font",
+        choices=font_names(),
+        default=None,
+        help="Bundled subtitle font family (default: SUBTITLE_FONT)",
     )
     parser.add_argument(
         "--bg-mode",
@@ -176,8 +196,8 @@ def parse_args() -> argparse.Namespace:
     if args.no_bg_music:
         args.bg_mode = "none"
 
-    # Fallback: if no --url and no --file, read VIDEO_URL from .env.
-    # On --resume, neither is required (the cached video sits in work_dir).
+    # Nếu không truyền URL/file thì lấy VIDEO_URL từ .env. Khi resume, video
+    # được tìm trong work_dir nên không bắt buộc hai tham số này.
     if not args.url and not args.file and not args.resume:
         if config.VIDEO_URL:
             args.url = config.VIDEO_URL
@@ -189,12 +209,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_video(work_dir: str, url: str | None, file_path: str | None) -> str:
-    """Locate the source video for this work_dir.
+    """Tìm video nguồn cho thư mục làm việc hiện tại.
 
-    Resume-friendly: reuse a previously downloaded/copied video in work_dir
-    instead of re-downloading. Files matching ``dubbed_video*.mp4`` are
-    treated as pipeline output, not source.
+    Khi resume, ưu tiên video đã có trong work_dir và bỏ qua các file
+    ``dubbed_video*.mp4`` vì đó là output đã kết xuất.
     """
+    # File được truyền trực tiếp luôn được ưu tiên, hữu ích khi nguồn nằm ngoài
+    # thư mục dự án.
     if file_path:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Video file not found: {file_path}")
@@ -223,7 +244,7 @@ def _resolve_video(work_dir: str, url: str | None, file_path: str | None) -> str
 
 
 def _detect_source_lang(text: str, default_lang: str) -> str:
-    """Detect if text is Chinese, Japanese, Korean, or default."""
+    """Đoán ngôn ngữ từ các dải Unicode, nếu không thì dùng giá trị mặc định."""
     if any('\u4e00' <= c <= '\u9fff' for c in text):
         return "zh"
     if any('\u3040' <= c <= '\u30ff' for c in text):
@@ -233,6 +254,7 @@ def _detect_source_lang(text: str, default_lang: str) -> str:
     return default_lang
 
 
+@track_pipeline("jp")
 def run_pipeline(
     url: str | None,
     file_path: str | None,
@@ -245,14 +267,24 @@ def run_pipeline(
     bg_duck_db: float = -12.0,
     burn_subtitles: bool = False,
     subtitle_y: float = 72.0,
-    subtitle_size: int = 38,
+    subtitle_size: int | None = None,
     ai_blur: bool = False,
+    subtitle_font: str | None = None,
+    subtitle_style: dict | SubtitleStyle | None = None,
 ) -> dict:
+    """Chạy toàn bộ pipeline tiếng Nhật và trả báo cáo kết quả.
+
+    Pipeline có thể tạo mới hoặc resume thư mục cũ; sau ASR sẽ dừng tại điểm
+    dịch thủ công cho đến khi transcript tiếng Nhật hợp lệ.
+    """
     start_time = time.time()
+    if voice.startswith("voice:"):
+        voice = pipeline_voice("jp", voice, vars(config))
 
     lang_code = LANG_MAP.get(source_lang, source_lang)
     logger.info(f"Source language: {lang_code}")
 
+    # Resume dùng lại artifact đã có; lần chạy mới tạo folder theo timestamp.
     if resume_dir:
         if not os.path.isdir(resume_dir):
             raise FileNotFoundError(f"Resume directory not found: {resume_dir}")
@@ -264,18 +296,32 @@ def run_pipeline(
         work_dir = os.path.abspath(ensure_dir(os.path.join(output_dir, folder_name)))
         logger.info(f"Output folder: {work_dir}")
 
+    profile = load_project_subtitles(work_dir)
+    if subtitle_font is not None:
+        profile["SUBTITLE_FONT"] = subtitle_font
+    if subtitle_size is not None:
+        profile["SUBTITLE_FONT_SIZE"] = str(subtitle_size)
+    if subtitle_style is not None:
+        profile.update(subtitle_style.to_settings() if isinstance(subtitle_style, SubtitleStyle) else subtitle_style)
+    profile = save_project_subtitles(work_dir, profile)
+    subtitle_font = profile["SUBTITLE_FONT"]
+    subtitle_size = int(profile["SUBTITLE_FONT_SIZE"])
+    subtitle_style = SubtitleStyle.from_settings(profile)
+
+    bind_project(work_dir, "jp")
+
     transcript_orig_path = os.path.join(work_dir, "transcript_original.json")
     transcript_jp_path = os.path.join(work_dir, "transcript_jp.json")
     audio_path = os.path.join(work_dir, "original_audio.wav")
 
-    # --- Step 1: Download or use local file ---
+    # ── Bước 1: tải video hoặc dùng file cục bộ ─────────────────────────────
     logger.info("=" * 60)
     logger.info("STEP 1: Acquiring video")
     video_path = _resolve_video(work_dir, url, file_path)
     logger.info(f"Video: {video_path}")
 
 
-    # --- Step 2: Extract audio ---
+    # ── Bước 2: trích audio chuẩn mono PCM ─────────────────────────────────
     logger.info("=" * 60)
     if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
         logger.info(f"STEP 2: Reusing existing extracted audio: {audio_path}")
@@ -283,7 +329,8 @@ def run_pipeline(
         logger.info("STEP 2: Extracting audio")
         extract_audio(video_path, audio_path)
 
-    # --- Step 2.5: Resolve background track for the dub merge ---
+    # ── Bước 2.5: chọn nhạc nền cho bản lồng tiếng ─────────────────────────
+    # Demucs giữ nhạc/hiệu ứng; duck giảm toàn bộ audio gốc; none dùng nền im lặng.
     background_path: str | None = None
     background_gain_db: float = 0.0
     if bg_mode == "demucs":
@@ -306,16 +353,22 @@ def run_pipeline(
     elif bg_mode == "none":
         logger.info("STEP 2.5 skipped: --bg-mode=none, dubbed audio uses silent base")
 
-    # --- Step 3: Speech-to-Text (ASR) & AI Subtitle Blur ---
+    # ── Bước 3: ASR và tùy chọn làm mờ phụ đề cứng ──────────────────────────
     logger.info("=" * 60)
     
     if ai_blur:
         logger.info("STEP 3A: Applying AI Subtitle Blur")
         blurred_video_path = os.path.join(work_dir, "video_ai_blurred.mp4")
-        if os.path.exists(blurred_video_path) and os.path.getsize(blurred_video_path) > 0:
+        if (
+            os.path.exists(blurred_video_path)
+            and os.path.getsize(blurred_video_path) > 0
+            and has_current_quality_marker(blurred_video_path, "ai_blur")
+        ):
             logger.info(f"Reusing existing AI blurred video: {blurred_video_path}")
             video_path = blurred_video_path
         else:
+            if os.path.exists(blurred_video_path):
+                logger.info("Existing AI-blurred video was created with an older quality profile; regenerating it.")
             success = apply_ai_blur(video_path, blurred_video_path)
             if success:
                 video_path = blurred_video_path
@@ -333,50 +386,46 @@ def run_pipeline(
         generate_srt(segments, os.path.join(work_dir, "transcript_original.srt"), text_field="text")
     logger.info(f"Transcribed {len(segments)} segments")
 
-    # --- Step 4: Translate to Japanese (manual via skill or web AI) ---
+    # ── Bước 4: điểm dừng dịch tiếng Nhật thủ công ──────────────────────────
     logger.info("=" * 60)
-    logger.info("STEP 4: Loading Japanese translation")
+    logger.info("STEP 4: Loading manual Japanese translation")
     
     is_valid_translation = False
     if os.path.exists(transcript_jp_path):
         try:
             with open(transcript_jp_path, encoding="utf-8") as f:
                 temp_segs = json.load(f)
-            if temp_segs and any("text_jp" in s for s in temp_segs):
+            if has_complete_translation(temp_segs, "text_jp", segments):
                 is_valid_translation = True
                 segments = temp_segs
-        except Exception:
-            pass
+            else:
+                logger.warning(
+                    "transcript_jp.json exists but is incomplete; manual translation is still required."
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(f"Cannot load manual translation file: {exc}")
 
     if is_valid_translation:
         logger.info(f"Reusing existing translation: {transcript_jp_path}")
-        # Generate the translated SRT file
-        generate_srt(segments, os.path.join(work_dir, "transcript_jp.srt"), text_field="text_jp")
+        # Tạo lại SRT tiếng Nhật để dùng khi burn subtitle.
+        pending_hint = os.path.join(work_dir, "TRANSLATE_PENDING.txt")
+        if os.path.exists(pending_hint):
+            os.remove(pending_hint)
     else:
-        # Automatically translate to pre-fill the translation file!
-        from src.translator import translate_segments_jp
-        try:
-            detected_lang = source_lang
-            if segments:
-                sample_text = " ".join(s.get("text", "") for s in segments[:3])
-                detected_lang = _detect_source_lang(sample_text, source_lang)
-                if detected_lang != source_lang:
-                    logger.info(f"Auto-detected true source language of transcript: {detected_lang} (was {source_lang})")
-                    
-            segments = translate_segments_jp(segments, detected_lang)
-            # Save it so the user has the pre-filled translation!
-            save_transcript(segments, transcript_jp_path)
-            logger.info("Automatic translation completed and saved to transcript_jp.json")
-        except Exception as e:
-            logger.error(f"Automatic translation failed: {e}")
-            # Save a placeholder copy anyway
-            save_transcript(segments, transcript_jp_path)
-            
-        _write_translate_pending_hint(work_dir, "ja-JP", source_lang)
-        logger.warning("Translation pending — see TRANSLATE_PENDING.txt in work dir")
-        return {"status": "translate_pending", "work_dir": work_dir}
+        hint_path = _write_translate_pending_hint(work_dir, "ja-JP", source_lang)
+        logger.warning(
+            "Manual translation required — no translation API was called. "
+            f"Edit transcript_jp.json from the desktop app or follow {hint_path}, then resume."
+        )
+        return {
+            "status": "translate_pending",
+            "session_id": folder_name,
+            "work_dir": work_dir,
+            "translation_file": transcript_jp_path,
+            "translation_hint": hint_path,
+        }
 
-    # --- Step 5: TTS for each segment ---
+    # ── Bước 5: tổng hợp từng segment bằng Azure TTS ────────────────────────
     logger.info("=" * 60)
     logger.info("STEP 5: Synthesizing Japanese audio (TTS)")
     seg_dir = ensure_dir(os.path.join(work_dir, "segments"))
@@ -395,18 +444,29 @@ def run_pipeline(
             f"(target: {seg['duration']:.1f}s, adjusted: {result['speed_adjusted']})"
         )
 
-    # --- Step 6: Merge audio ---
+    # ── Bước 6: đặt segment lên timeline và trộn với background ────────────
     logger.info("=" * 60)
     logger.info("STEP 6: Merging audio segments")
     total_duration = max(seg["end"] for seg in segments) + 1.0 if segments else 0
+    fit_dir = ensure_dir(os.path.join(work_dir, "segments_fit"))
+    max_extra = max(1.0, config.TTS_OVERFLOW_MAX_SPEED / config.TTS_SPEED)
+    fit_adjustments = fit_segments_to_timeline(segments, seg_dir, fit_dir, max_speedup=max_extra)
+    for adjustment in fit_adjustments:
+        adjustment["effective_speed"] = round(config.TTS_SPEED * adjustment["speed"], 3)
+    with open(os.path.join(work_dir, "fit_adjustments.json"), "w", encoding="utf-8") as handle:
+        json.dump(fit_adjustments, handle, ensure_ascii=False, indent=2)
+    subtitle_segments = generate_tts_subtitles(
+        segments, fit_dir, os.path.join(work_dir, "transcript_jp.srt"), "text_jp")
+    apply_fitted_timing_to_results(tts_results, subtitle_segments, fit_adjustments)
+    logger.info("Subtitle timing follows fitted Japanese speech; silent WAV padding is excluded.")
     merged_audio_path = os.path.join(work_dir, "audio_jp_full.wav")
     merge_segments(
-        segments, seg_dir, merged_audio_path, total_duration,
+        segments, fit_dir, merged_audio_path, total_duration,
         background_path=background_path,
         background_gain_db=0.6,
     )
 
-    # --- Step 7: Merge video (optional) ---
+    # ── Bước 7: ghép audio với video (có thể bỏ qua) ────────────────────────
     dubbed_video_path = None
     if not skip_video:
         logger.info("=" * 60)
@@ -420,9 +480,11 @@ def run_pipeline(
             srt_path=srt_file,
             y_pixel=subtitle_y,
             font_size=subtitle_size,
+            font_name=subtitle_font,
+            subtitle_style=subtitle_style,
         )
 
-    # --- Step 8: Generate thumbnails + YouTube metadata ---
+    # ── Bước 8: tạo nội dung YouTube nếu đã cấu hình Gemini ────────────────
     content_result = {"thumbnails": [], "metadata": {}}
     if config.GOOGLE_API_KEY:
         logger.info("=" * 60)
@@ -444,7 +506,7 @@ def run_pipeline(
     else:
         logger.info("Skipping thumbnail/metadata generation (GOOGLE_API_KEY not set)")
 
-    # --- Generate report ---
+    # Ghi report để GUI/batch biết trạng thái và các file đầu ra.
     elapsed = time.time() - start_time
     report = {
         "session_id": folder_name,
@@ -463,6 +525,7 @@ def run_pipeline(
             "transcript_original_srt": os.path.join(work_dir, "transcript_original.srt"),
             "transcript_jp_json": os.path.join(work_dir, "transcript_jp.json"),
             "transcript_jp_srt": os.path.join(work_dir, "transcript_jp.srt"),
+            "subtitle_timing": os.path.join(work_dir, "subtitle_timing.json"),
             "audio_jp_full": merged_audio_path,
             "dubbed_video": dubbed_video_path,
             "thumbnails": content_result.get("thumbnails", []),
@@ -474,7 +537,7 @@ def run_pipeline(
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # --- Generate timing guide for CapCut editing ---
+    # Ghi timing guide giúp chỉnh những segment dài/ngắn trong CapCut.
     timing_guide = _build_timing_guide(report, segments, tts_results)
     timing_path = os.path.join(work_dir, "timing_guide.json")
     with open(timing_path, "w", encoding="utf-8") as f:
@@ -495,6 +558,7 @@ def run_pipeline(
 
 
 def main():
+    """Đọc tham số CLI, chạy pipeline Nhật và trả mã lỗi phù hợp cho shell."""
     args = parse_args()
     try:
         run_pipeline(
@@ -510,6 +574,8 @@ def main():
             burn_subtitles=args.burn_subtitles,
             subtitle_y=args.subtitle_y,
             subtitle_size=args.subtitle_size,
+            subtitle_font=args.subtitle_font,
+            subtitle_style=style_overrides_from_args(args),
             ai_blur=args.ai_blur,
         )
     except Exception as e:

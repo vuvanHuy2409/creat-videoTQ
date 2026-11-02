@@ -1,20 +1,28 @@
-"""
-subtitle_detector.py — OCR-based subtitle zone detector.
+"""Bộ phát hiện vùng phụ đề dựa trên OCR.
 
-Samples frames from a video, runs OCR on the bottom 35% (where Chinese
-subtitles typically appear), and returns the bounding box of the subtitle
-zone so the merger can cover + replace it.
+OCR chỉ chạy trong dải 20%-40% tính từ đáy frame. Cách này tập trung vào vùng
+phụ đề và tránh nhận diện chữ không liên quan ở nơi khác.
 """
 import os
 import cv2
 import numpy as np
 from src.utils import setup_logging
+from src.ocr_zone import (
+    OCR_ZONE_BOTTOM,
+    OCR_ZONE_LABEL,
+    OCR_ZONE_TOP,
+    crop_ocr_zone,
+    get_ocr_zone_bounds,
+)
+from src.ocr_image_replace import detect_chinese_boxes
 
 logger = setup_logging("subtitle_detector")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SAMPLE_COUNT   = 12     # number of frames to sample
-SCAN_ZONE_TOP  = 0.65   # only scan bottom 35% of frame height
+# ── Cấu hình ──────────────────────────────────────────────────────────────────
+SAMPLE_COUNT   = 12     # số frame lấy mẫu
+# Giữ alias để tương thích với code bên ngoài đã import hằng số cũ.
+SCAN_ZONE_TOP    = OCR_ZONE_TOP
+SCAN_ZONE_BOTTOM = OCR_ZONE_BOTTOM
 PADDING_H      = 6      # extra vertical padding around detected text (px)
 PADDING_W      = 20     # extra horizontal padding
 MIN_CONFIDENCE = 0.4    # minimum OCR confidence to count as subtitle text
@@ -22,6 +30,7 @@ MIN_CONFIDENCE = 0.4    # minimum OCR confidence to count as subtitle text
 
 
 def _get_frame_count(video_path: str) -> int:
+    """Lấy số frame của video, tối thiểu trả về 1 để tránh chia cho 0."""
     cap = cv2.VideoCapture(video_path)
     n   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
@@ -29,7 +38,7 @@ def _get_frame_count(video_path: str) -> int:
 
 
 def _sample_frames(video_path: str, count: int) -> list[np.ndarray]:
-    """Extract `count` frames spread evenly across the video."""
+    """Trích ``count`` frame phân bố đều trong toàn bộ video."""
     cap    = cv2.VideoCapture(video_path)
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames = []
@@ -44,16 +53,14 @@ def _sample_frames(video_path: str, count: int) -> list[np.ndarray]:
 
 
 def _crop_scan_zone(frame: np.ndarray) -> tuple[np.ndarray, int]:
-    """Return (cropped_region, y_offset) for the bottom portion."""
-    h      = frame.shape[0]
-    y_off  = int(h * SCAN_ZONE_TOP)
-    return frame[y_off:, :], y_off
+    """Trả về vùng crop và offset Y của dải OCR cố định."""
+    return crop_ocr_zone(frame)
 
 
 def detect_subtitle_zone(video_path: str) -> dict | None:
     """
-    Detect the global subtitle bounding box (in full-frame coordinates).
-    Useful as a fallback.
+    Phát hiện bounding box phụ đề tổng quát theo tọa độ frame gốc.
+    Hàm này chủ yếu dùng làm phương án dự phòng.
     """
     try:
         import easyocr
@@ -65,6 +72,7 @@ def detect_subtitle_zone(video_path: str) -> dict | None:
         return None
 
     frame_h, frame_w = frames[0].shape[:2]
+    logger.info(f"Scanning OCR zone: {OCR_ZONE_LABEL}")
 
     import ssl
     try:
@@ -77,26 +85,18 @@ def detect_subtitle_zone(video_path: str) -> dict | None:
     all_boxes: list[tuple[int, int, int, int]] = []
 
     for fi, frame in enumerate(frames):
-        crop, y_off = _crop_scan_zone(frame)
-        results     = reader.readtext(crop, detail=1)
-        for (bbox, text, conf) in results:
-            if conf < MIN_CONFIDENCE or not text.strip():
-                continue
-            xs = [pt[0] for pt in bbox]
-            ys = [pt[1] for pt in bbox]
-            x1 = int(min(xs))
-            y1 = int(min(ys)) + y_off
-            x2 = int(max(xs))
-            y2 = int(max(ys)) + y_off
-            all_boxes.append((x1, y1, x2, y2))
+        # Dùng chung detector với nhánh xử lý ảnh: có dải đệm ở mốc 80% và chấp
+        # nhận chữ Trung confidence thấp khi EasyOCR vẫn đọc được ký tự.
+        all_boxes.extend(detect_chinese_boxes(frame, reader))
 
     if not all_boxes:
         return None
 
-    x1 = max(0,        min(b[0] for b in all_boxes) - PADDING_W)
-    y1 = max(0,        min(b[1] for b in all_boxes) - PADDING_H)
-    x2 = min(frame_w,  max(b[2] for b in all_boxes) + PADDING_W)
-    y2 = min(frame_h,  max(b[3] for b in all_boxes) + PADDING_H)
+    zone_top, zone_bottom = get_ocr_zone_bounds(frame_h)
+    x1 = max(0,          min(b[0] for b in all_boxes) - PADDING_W)
+    y1 = max(zone_top,   min(b[1] for b in all_boxes) - PADDING_H)
+    x2 = min(frame_w,    max(b[2] for b in all_boxes) + PADDING_W)
+    y2 = min(zone_bottom, max(b[3] for b in all_boxes) + PADDING_H)
 
     return {
         "x":       x1,
@@ -110,8 +110,8 @@ def detect_subtitle_zone(video_path: str) -> dict | None:
 
 def detect_subtitle_positions_for_chunks(video_path: str, chunks: list[dict]) -> list[dict]:
     """
-    For each chunk, extract the middle frame, run OCR to find the exact y-position
-    and height of the Chinese subtitle. Updates each chunk dict with "zone": {x, y, w, h} or None.
+    Với mỗi chunk, đọc frame ở giữa, chạy OCR để tìm vị trí Y và chiều cao
+    phụ đề Trung Quốc, sau đó gắn ``zone`` vào chunk hoặc đặt ``None``.
     """
     try:
         import easyocr
@@ -129,7 +129,7 @@ def detect_subtitle_positions_for_chunks(video_path: str, chunks: list[dict]) ->
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
-    # Initialize EasyOCR
+    # Khởi tạo EasyOCR; tạm nới SSL vì model có thể cần tải file trọng số.
     import ssl
     try:
         _orig_ctx = ssl._create_default_https_context
@@ -138,7 +138,10 @@ def detect_subtitle_positions_for_chunks(video_path: str, chunks: list[dict]) ->
     finally:
         ssl._create_default_https_context = _orig_ctx
 
-    logger.info(f"Scanning {len(chunks)} chunks for precise vertical subtitle coordinates...")
+    logger.info(
+        f"Scanning {len(chunks)} chunks for precise vertical subtitle coordinates "
+        f"in OCR zone: {OCR_ZONE_LABEL}..."
+    )
 
     for idx, chunk in enumerate(chunks):
         t_mid = (chunk["start"] + chunk["end"]) / 2.0
@@ -152,23 +155,9 @@ def detect_subtitle_positions_for_chunks(video_path: str, chunks: list[dict]) ->
             chunk["zone"] = None
             continue
 
-        # Crop to the bottom subtitle area
-        y_off = int(frame_h * SCAN_ZONE_TOP)
-        crop = frame[y_off:, :]
-
-        results = reader.readtext(crop, detail=1)
         candidates = []
-        for (bbox, text, conf) in results:
-            if conf < MIN_CONFIDENCE or not text.strip():
-                continue
-            xs = [pt[0] for pt in bbox]
-            ys = [pt[1] for pt in bbox]
-            x1 = int(min(xs))
-            y1 = int(min(ys)) + y_off
-            x2 = int(max(xs))
-            y2 = int(max(ys)) + y_off
-
-            # Center distance calculation
+        for x1, y1, x2, y2 in detect_chinese_boxes(frame, reader):
+            # Ưu tiên box nằm gần tâm màn hình vì phụ đề thường được căn giữa.
             text_center = (x1 + x2) / 2.0
             screen_center = frame_w / 2.0
             center_dist = abs(text_center - screen_center)
@@ -179,22 +168,23 @@ def detect_subtitle_positions_for_chunks(video_path: str, chunks: list[dict]) ->
                 "height": y2 - y1,
                 "width": x2 - x1,
                 "center_dist": center_dist,
-                "text": text,
+                "text": "Chinese OCR",
             })
 
         if candidates:
-            # We filter out very small noise boxes, and prioritize centered text
+            # Bỏ box quá nhỏ/nhiễu rồi ưu tiên box gần tâm và cao hơn.
             candidates = [c for c in candidates if c["height"] > 10]
             if candidates:
-                # Sort primarily by how centered they are horizontally
+                # Sắp xếp chính theo khoảng cách tới tâm ngang của video.
                 candidates.sort(key=lambda c: (c["center_dist"], -c["height"]))
                 best = candidates[0]
                 
-                # Add horizontal and vertical padding
+                # Thêm padding ngang/dọc để che trọn nét chữ.
                 x1_pad = max(0, best["x1"] - PADDING_W)
-                y1_pad = max(0, best["y1"] - PADDING_H)
+                zone_top, zone_bottom = get_ocr_zone_bounds(frame_h)
+                y1_pad = max(zone_top, best["y1"] - PADDING_H)
                 x2_pad = min(frame_w, best["x2"] + PADDING_W)
-                y2_pad = min(frame_h, best["y2"] + PADDING_H)
+                y2_pad = min(zone_bottom, best["y2"] + PADDING_H)
 
                 chunk["zone"] = {
                     "x": x1_pad,

@@ -1,10 +1,10 @@
-"""Batch Vietnamese Video Dubbing — Read URLs from Excel, process each, update status.
+"""Chạy batch lồng tiếng tiếng Việt: đọc URL từ Excel và cập nhật trạng thái.
 
 Usage:
-    python batch_run_vi.py                                  # Use default output/video_link.xlsx
-    python batch_run_vi.py --excel path/to/links.xlsx       # Custom Excel path
-    python batch_run_vi.py --voice male                     # Skip voice prompt, use male
-    python batch_run_vi.py --voice female                   # Skip voice prompt, use female
+    python batch_run_vi.py                                  # Dùng output/video_link.xlsx mặc định
+    python batch_run_vi.py --excel path/to/links.xlsx       # Chọn file Excel khác
+    python batch_run_vi.py --voice male                     # Dùng voice nam, không hỏi lại
+    python batch_run_vi.py --voice female                   # Dùng voice nữ, không hỏi lại
 """
 import argparse
 import os
@@ -22,6 +22,7 @@ DEFAULT_EXCEL = "output/video_link.xlsx"
 
 
 def main():
+    """Chạy tuần tự các video tiếng Việt trong Excel và lưu trạng thái."""
     parser = argparse.ArgumentParser(description="Batch Vietnamese Video Dubbing: process URLs from Excel")
     parser.add_argument(
         "--excel",
@@ -47,19 +48,25 @@ def main():
     parser.add_argument(
         "--output-dir",
         default=_get_default_vi_output_dir(),
-        help="Output directory (default: ANKO Project/VN)",
+        help="Output directory (default: VIETNAMESE_OUTPUT_DIR or OUTPUT_DIR/VN)",
     )
     args = parser.parse_args()
 
-    # Resolve voice ID
+    # Chọn voice ID theo cờ CLI, cấu hình .env hoặc hỏi tương tác.
     if args.voice == "male":
         voice_id = config.VIETNAMESE_VOICEID_MALE
     elif args.voice == "female":
         voice_id = config.VIETNAMESE_VOICEID_FEMALE
+    elif config.VOICE_TYPE == "male":
+        voice_id = config.VIETNAMESE_VOICEID_MALE
+        logger.info("Using VOICE_TYPE=male from .env")
+    elif config.VOICE_TYPE == "female":
+        voice_id = config.VIETNAMESE_VOICEID_FEMALE
+        logger.info("Using VOICE_TYPE=female from .env")
     else:
         voice_id = _ask_voice_gender()
 
-    # Load Excel
+    # Mở workbook và dùng sheet hiện tại làm danh sách đầu vào.
     if not os.path.exists(args.excel):
         logger.error(f"Excel file not found: {args.excel}")
         sys.exit(1)
@@ -67,7 +74,7 @@ def main():
     wb = load_workbook(args.excel)
     ws = wb.active
 
-    # Find rows that need processing (status column is empty)
+    # Chỉ xử lý dòng có URL nhưng chưa có trạng thái.
     pending_rows = []
     for row_idx in range(2, ws.max_row + 1):
         url = ws.cell(row=row_idx, column=1).value
@@ -84,6 +91,7 @@ def main():
 
     success_count = 0
     fail_count = 0
+    pending_count = 0
 
     for i, row_idx in enumerate(pending_rows):
         url = ws.cell(row=row_idx, column=1).value
@@ -101,6 +109,16 @@ def main():
 
             folder_name = report["session_id"]
 
+            if report.get("status") == "translate_pending":
+                ws.cell(row=row_idx, column=2, value="TRANSLATION_PENDING")
+                ws.cell(row=row_idx, column=3, value=report["work_dir"])
+                pending_count += 1
+                logger.info(
+                    f"[{i + 1}/{len(pending_rows)}] TRANSLATION_PENDING → {report['work_dir']}"
+                )
+                wb.save(args.excel)
+                continue
+
             ws.cell(row=row_idx, column=2, value="SUCCESS")
             ws.cell(row=row_idx, column=3, value=folder_name)
 
@@ -116,14 +134,15 @@ def main():
             fail_count += 1
             logger.error(f"[{i + 1}/{len(pending_rows)}] FAILED: {error_msg}")
 
-        # Save Excel after each video (crash-safe)
+        # Lưu sau từng video để giữ tiến độ an toàn khi có sự cố.
         wb.save(args.excel)
 
-    # Summary
+    # Tổng kết kết quả của cả batch.
     logger.info("=" * 60)
     logger.info("BATCH COMPLETE (Vietnamese)")
     logger.info(f"  Total:   {len(pending_rows)}")
     logger.info(f"  Success: {success_count}")
+    logger.info(f"  Translation pending: {pending_count}")
     logger.info(f"  Failed:  {fail_count}")
     logger.info(f"  Excel:   {args.excel}")
     logger.info("=" * 60)

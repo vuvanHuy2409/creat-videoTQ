@@ -1,0 +1,138 @@
+{
+  "google_fonts_revision": "45e3d5269e4a17d823f6d84470bc084dc5ae46f6",
+  "note": "Derived static instances renamed to AutoDub families; original OFL licenses included.",
+  "fonts": [
+    {
+      "name": "Phudu",
+      "family": "AutoDub Phudu",
+      "file": "Phudu-Black.ttf",
+      "weight": 900,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/phudu/Phudu[wght].ttf",
+      "source_sha256": "56dfb12f5f7b6a851f3638cf975d7733fbcaba0a8f81865513f025730e3536a0",
+      "sha256": "73549ba9b0f9ae3c667e8bd069de12a991715c340a9b89eb9af1da734584a0bd",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/phudu/OFL.txt"
+    },
+    {
+      "name": "Be Vietnam Pro",
+      "family": "AutoDub Be Vietnam Pro",
+      "file": "BeVietnamPro-ExtraBold.ttf",
+      "weight": 800,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/bevietnampro/BeVietnamPro-ExtraBold.ttf",
+      "source_sha256": "44dbfa01553d227bec76ba6446c5618870a76a4a3297f41630dde859d0650d02",
+      "sha256": "4939cd13d1af2820dc25d61dd671e696f98afa0a49e0f0f6b7ca754b57857785",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/bevietnampro/OFL.txt"
+    },
+    {
+      "name": "Montserrat",
+      "family": "AutoDub Montserrat",
+      "file": "Montserrat-ExtraBold.ttf",
+      "weight": 800,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/montserrat/Montserrat[wght].ttf",
+      "source_sha256": "0f7b311b2f3279e4eef9b2f968bcdbab6e28f4daeb1f049f4f278a902bcd82f7",
+      "sha256": "62c326287f801c5b13e933c70afb10a1bff12d0187424176a6aaf492917b2fda",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/montserrat/OFL.txt"
+    },
+    {
+      "name": "Inter",
+      "family": "AutoDub Inter",
+      "file": "Inter-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/inter/Inter[opsz,wght].ttf",
+      "source_sha256": "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031",
+      "sha256": "c4378d63eba78931a3d3af4b567f02f530d2af4f1cbf5fe6950981008d63b613",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/inter/OFL.txt"
+    },
+    {
+      "name": "Roboto",
+      "family": "AutoDub Roboto",
+      "file": "Roboto-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/roboto/Roboto[wdth,wght].ttf",
+      "source_sha256": "d7598e12c5dbef095ff8272cfc55da0250bd07fbdecbac8a530b9b277872a134",
+      "sha256": "d32110a922d8a8f3293dc243b73fd5ca8979904501ce4ea3f3ba790aa9d2de95",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/roboto/OFL.txt"
+    },
+    {
+      "name": "Roboto Condensed",
+      "family": "AutoDub Roboto Condensed",
+      "file": "RobotoCondensed-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/robotocondensed/RobotoCondensed[wght].ttf",
+      "source_sha256": "dace262afcee68a5276f200d8026c57221735c0118ab5fda8c2c0d3dc409a8d0",
+      "sha256": "8307f4f8799d907a476fa619d6cc6bfe995e6089dd4e03c2e9aa0df7f110733c",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/robotocondensed/OFL.txt"
+    },
+    {
+      "name": "Oswald",
+      "family": "AutoDub Oswald",
+      "file": "Oswald-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/oswald/Oswald[wght].ttf",
+      "source_sha256": "5b38c246e255a12f5712d640d56bcced0472466fc68983d2d0410ec0457c2817",
+      "sha256": "9b84aed891716b89d3e7e2836db0dfc8fa11cbc39564774297b2835cbaa6dc77",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/oswald/OFL.txt"
+    },
+    {
+      "name": "Barlow Condensed",
+      "family": "AutoDub Barlow Condensed",
+      "file": "BarlowCondensed-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/barlowcondensed/BarlowCondensed-Bold.ttf",
+      "source_sha256": "e476562ec9c1e16cf16475895b511f08c804f438cc9a9f80a44ea50a0eeb5b65",
+      "sha256": "b7acddb0579570a81e4d95d6a460ff943c9b23eaaef73008004035d4db8a60ec",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/barlowcondensed/OFL.txt"
+    },
+    {
+      "name": "Anton",
+      "family": "AutoDub Anton",
+      "file": "Anton-Regular.ttf",
+      "weight": 400,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/anton/Anton-Regular.ttf",
+      "source_sha256": "a4ba3a92350ebb031da0cb47630ac49eb265082ca1bc0450442f4a83ab947cab",
+      "sha256": "8b7a32ecc248fc82f4a5b60ed5644654243972f4c61358f0895f47646f1843ed",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/anton/OFL.txt"
+    },
+    {
+      "name": "Archivo",
+      "family": "AutoDub Archivo",
+      "file": "Archivo-Black.ttf",
+      "weight": 900,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/archivo/Archivo[wdth,wght].ttf",
+      "source_sha256": "0e094a7d3c7c4c25cf1310c4b30014f1dae9332220b1c2c88f4fa996f0b05053",
+      "sha256": "cbfcc115104739c10bf34f26b20d8ab48bd83e7370e621296afca639ea5a16ac",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/archivo/OFL.txt"
+    },
+    {
+      "name": "Noto Sans",
+      "family": "AutoDub Noto Sans",
+      "file": "NotoSans-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/notosans/NotoSans[wdth,wght].ttf",
+      "source_sha256": "bfb7bb691513f12e734dc346c03a03f784912432d7e3fa8e56efcf906fe86b3d",
+      "sha256": "1af56af237e0dcc09a110c7f97c6aa63410e7ac459b817260dbfcf8f150ad950",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/notosans/OFL.txt"
+    },
+    {
+      "name": "Noto Sans JP",
+      "family": "AutoDub Noto Sans JP",
+      "file": "NotoSansJP-Bold.ttf",
+      "weight": 700,
+      "source": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/notosansjp/NotoSansJP[wght].ttf",
+      "source_sha256": "c2f3b4d463500a2ddcd3849cded1fceeb9fd6d1c32e6cbecd568453ba50fc68f",
+      "sha256": "485ae852a46641813820a0d0671ee70c9e7f6363ad858a6eee251267ecb9d771",
+      "license": "SIL Open Font License 1.1",
+      "license_url": "https://raw.githubusercontent.com/google/fonts/45e3d5269e4a17d823f6d84470bc084dc5ae46f6/ofl/notosansjp/OFL.txt"
+    }
+  ]
+}

@@ -1,18 +1,14 @@
-"""Douyin downloader using a headless Chromium (Playwright).
+"""Tải video Douyin bằng Chromium và Playwright.
 
-Background: as of 2025+ yt-dlp's Douyin/TikTok extractor is broken because the
-detail endpoint (`/aweme/v1/web/aweme/detail/`) requires an `a_bogus` /
-`msToken` / `x-secsdk-web-signature` signature triplet that yt-dlp cannot
-generate — every request returns an empty body and the extractor surfaces
-"Fresh cookies (not necessarily logged in) are needed".
+Nguyên nhân: extractor Douyin của yt-dlp cần bộ chữ ký ``a_bogus`` /
+``msToken`` / ``x-secsdk-web-signature`` mà yt-dlp không tự tạo được, nên
+endpoint chi tiết thường trả body rỗng.
 
-Workaround: load the video page in a real browser (no login needed), intercept
-the DASH segment requests it issues to `*.zjcdn.com/.../media-video-*/` and
-`media-audio-*/`, then download those direct CDN URLs with `requests` and mux
-them with ffmpeg.
+Giải pháp là mở trang video trong trình duyệt thật, bắt các request DASH tới
+CDN ``media-video-*``/``media-audio-*``, tải trực tiếp bằng requests rồi mux
+hai stream bằng FFmpeg.
 
-Requires: playwright + chromium (`pip install playwright && playwright install
-chromium`), ffmpeg on PATH.
+Yêu cầu: playwright + Chromium và FFmpeg có trong PATH.
 """
 import re
 import subprocess
@@ -41,6 +37,7 @@ _VIDEO_ID_RE = re.compile(r"/(?:video|note)/(\d+)|modal_id=(\d+)")
 
 
 def is_douyin_url(url: str) -> bool:
+    """Kiểm tra URL có thuộc miền Douyin hay không."""
     if not url:
         return False
     host = urllib.parse.urlparse(url.strip()).netloc.lower()
@@ -48,6 +45,7 @@ def is_douyin_url(url: str) -> bool:
 
 
 def _bitrate_of(url: str) -> int:
+    """Đọc bitrate ``br`` từ query để chọn stream CDN chất lượng cao hơn."""
     qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
     try:
         return int(qs.get("br", ["0"])[0])
@@ -60,11 +58,11 @@ def _extract_via_playwright(
     wait_seconds: float = 45.0,
     headless: bool | None = None,
 ) -> dict:
-    """Open the Douyin page and capture direct CDN URLs for video + audio.
+    """Mở trang Douyin và bắt URL CDN trực tiếp của video/audio.
 
-    Douyin detects vanilla headless Chromium and refuses to start the player.
-    We default to headful (headless=False) on macOS and Windows to easily bypass
-    anti-bot detection, and headless on Linux.
+    Douyin có thể phát hiện Chromium headless và không khởi động player. Vì vậy
+    mặc định macOS/Windows dùng cửa sổ thật để giảm khả năng bị chặn; Linux
+    dùng headless.
     """
     if headless is None:
         import platform
@@ -81,12 +79,11 @@ def _extract_via_playwright(
         context = p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
             headless=headless,
-            user_agent=_UA,
             viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
             args=launch_args
         )
-        # Hide webdriver flag — Douyin checks navigator.webdriver
+        # Ẩn cờ webdriver vì Douyin kiểm tra navigator.webdriver.
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
@@ -114,7 +111,7 @@ def _extract_via_playwright(
             if "aweme/detail" in u or "iteminfo" in u:
                 try:
                     data = res.json()
-                    # Try extracting video URLs directly from API responses if present
+                    # Nếu response API có sẵn play_addr thì cũng lưu lại để dự phòng.
                     aweme = data.get("aweme_detail") or data.get("item_list", [{}])[0]
                     video = aweme.get("video", {})
                     play_addr = video.get("play_addr", {}).get("url_list", [])
@@ -126,8 +123,8 @@ def _extract_via_playwright(
         page.on("request", on_request)
         page.on("response", on_response)
 
-        # Normalize URL to a direct video link if a video ID is present
-        # This prevents issues with search pages or modal popups not auto-playing
+        # Đổi sang URL video trực tiếp nếu lấy được ID, tránh trang tìm kiếm hoặc
+        # popup modal không tự phát đúng video.
         m = _VIDEO_ID_RE.search(url)
         if m:
             vid = m.group(1) or m.group(2)
@@ -140,7 +137,7 @@ def _extract_via_playwright(
         except Exception as e:
             logger.warning(f"page.goto encountered warning/timeout: {e}. Checking captured requests...")
 
-        # Attempt to trigger video playback by clicking or scrolling if video didn't start automatically
+        # Cuộn nhẹ để kích hoạt player nếu trang chưa tự tải video.
         try:
             page.evaluate("window.scrollTo(0, 200);")
         except Exception:
@@ -197,6 +194,7 @@ def _extract_via_playwright(
 
 
 def _download_stream(url: str, dest: Path) -> int:
+    """Tải stream CDN theo từng khối và trả về tổng số byte."""
     headers = {"User-Agent": _UA, "Referer": _REFERER}
     size = 0
     with requests.get(url, headers=headers, stream=True, timeout=120) as r:
@@ -210,6 +208,7 @@ def _download_stream(url: str, dest: Path) -> int:
 
 
 def _ffmpeg_mux(video_path: Path, audio_path: Path, output_path: Path) -> None:
+    """Ghép stream video và audio mà không encode lại."""
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
@@ -223,6 +222,7 @@ def _ffmpeg_mux(video_path: Path, audio_path: Path, output_path: Path) -> None:
 
 
 def _ffprobe_duration(path: Path) -> float:
+    """Đọc thời lượng file bằng ffprobe; lỗi thì trả 0."""
     try:
         out = subprocess.check_output(
             [
@@ -243,11 +243,10 @@ def download_douyin(
     output_dir: str,
     filename: str | None = None,
 ) -> dict:
-    """Download a Douyin video and return metadata matching download_one() shape.
+    """Tải video Douyin và trả metadata cùng cấu trúc với ``download_one``.
 
-    Returned dict keys:
-        input_url, canonical_url, platform, video_id, title, uploader,
-        duration, filepath
+    Các khóa trả về gồm URL gốc, URL chuẩn hóa, nền tảng, ID, tiêu đề,
+    uploader, duration và filepath.
     """
     if not url:
         raise ValueError("URL cannot be empty")
@@ -256,7 +255,7 @@ def download_douyin(
     if m:
         url = m.group(0)
 
-    # 1. Resolve mobile shortlinks to avoid jumping to the next video in the feed
+    # Bước 1: giải shortlink mobile để không bị chuyển sang video kế tiếp trong feed.
     if "v.douyin.com" in url:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"}

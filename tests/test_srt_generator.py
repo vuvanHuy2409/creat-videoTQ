@@ -1,3 +1,5 @@
+"""Kiểm thử sinh file SRT cho văn bản gốc và bản dịch tiếng Nhật."""
+
 import os
 from src.srt_generator import generate_srt
 
